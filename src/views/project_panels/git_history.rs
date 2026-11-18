@@ -1,14 +1,18 @@
 use super::git_workflow::{git_control, git_quiet};
 use super::*;
+use crate::views::commit_text::{self, tint};
 
 // Timeline geometry. Rows sit edge to edge so the graph line stays continuous.
-const HISTORY_ROW_HEIGHT: f32 = 48.0;
-const DAY_ROW_HEIGHT: f32 = 28.0;
+const HISTORY_ROW_HEIGHT: f32 = 52.0;
+const DAY_ROW_HEIGHT: f32 = 32.0;
 const ROW_INSET: f32 = 8.0;
 const GRAPH_WIDTH: f32 = 14.0;
 const NODE_SIZE: f32 = 8.0;
-// Center of the subject line inside a commit row's content box.
-const NODE_CENTER: f32 = 14.0;
+// The subject and meta lines, centered in a commit row's 50px content box.
+const SUBJECT_LINE: f32 = 20.0;
+const LINE_GAP: f32 = 4.0;
+// Center of the subject line: (50 - (20 + 4 + 16)) / 2 + 20 / 2.
+const NODE_CENTER: f32 = 15.0;
 
 #[derive(Clone)]
 enum HistoryRow {
@@ -356,17 +360,20 @@ impl GitPanel {
                             .border_1()
                             .border_color(rgba(0))
                             .child(timeline(row > 0, row > 0, None))
+                            // A muted label and a rule set the day apart from the commits
+                            // without competing with their subjects.
                             .child(
                                 div()
-                                    .flex_1()
-                                    .min_w_0()
+                                    .flex_shrink_0()
+                                    .max_w(gpui::relative(0.7))
                                     .truncate()
                                     .text_size(px(chrome::DETAIL_TEXT_SIZE))
                                     .line_height(px(chrome::DETAIL_LINE_HEIGHT))
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme::ash())
                                     .child(label.clone()),
                             )
+                            .child(div().flex_1().min_w(px(8.0)).h(px(1.0)).bg(theme::edge()))
                             .when(unpushed > 0, |line| {
                                 line.child(
                                     div()
@@ -394,11 +401,29 @@ impl GitPanel {
                 let commit = &self.history.commits[index];
                 let selected = self.history.selected == index;
                 let prefix = commit.prefix();
+                let repository = self.repository.as_ref();
+                // HEAD is labeled with its branch, which says more than `HEAD`; a
+                // detached HEAD keeps the plain label.
+                let head = commit.head.then(|| {
+                    repository
+                        .and_then(|repository| repository.branch.clone())
+                        .map_or(("HEAD".to_owned(), false), |branch| (branch, true))
+                });
+                // Next to its own branch chip, `origin/main` shortens to `origin`.
                 let upstream = commit
                     .remote_tip
-                    .then(|| self.repository.as_ref()?.upstream.as_ref())
+                    .then(|| repository?.upstream.as_ref())
                     .flatten()
-                    .map(|upstream| upstream.label.clone());
+                    .map(|upstream| {
+                        let label = upstream.label.as_str();
+                        head.as_ref()
+                            .filter(|(_, branch)| *branch)
+                            .and_then(|(name, _)| label.strip_suffix(name.as_str()))
+                            .and_then(|remote| remote.strip_suffix('/'))
+                            .filter(|remote| !remote.is_empty())
+                            .unwrap_or(label)
+                            .to_owned()
+                    });
                 let mut tooltip = format!(
                     "{}\n{} · {}\n{}",
                     commit.subject, commit.author, commit.date, commit.id
@@ -406,6 +431,7 @@ impl GitPanel {
                 if commit.local == Some(true) {
                     tooltip.push_str("\nNot pushed yet");
                 }
+                let summary = prefix.map_or(commit.subject.as_str(), |prefix| prefix.summary);
                 div()
                     .h(px(HISTORY_ROW_HEIGHT))
                     .w_full()
@@ -454,16 +480,16 @@ impl GitPanel {
                                     .min_w_0()
                                     .flex()
                                     .flex_col()
-                                    .gap(px(2.0))
+                                    .gap(px(LINE_GAP))
                                     .child(
                                         div()
-                                            .h(px(20.0))
+                                            .h(px(SUBJECT_LINE))
                                             .min_w_0()
                                             .flex()
                                             .items_center()
                                             .gap(px(6.0))
                                             .when_some(prefix, |line, prefix| {
-                                                line.child(prefix_badge(prefix))
+                                                line.child(commit_text::prefix_badge(prefix))
                                             })
                                             .child(
                                                 div()
@@ -471,45 +497,49 @@ impl GitPanel {
                                                     .min_w_0()
                                                     .truncate()
                                                     .text_size(px(13.0))
-                                                    .line_height(px(20.0))
+                                                    .line_height(px(SUBJECT_LINE))
                                                     .text_color(theme::bone())
-                                                    .child(
-                                                        prefix
-                                                            .map_or(commit.subject.as_str(), |p| {
-                                                                p.summary
-                                                            })
-                                                            .to_owned(),
-                                                    ),
+                                                    .when(selected, |line| {
+                                                        line.font_weight(FontWeight::MEDIUM)
+                                                    })
+                                                    .child(commit_text::subject(summary)),
                                             ),
                                     )
+                                    // Who and when stay on one quiet line with references at
+                                    // the end. The hash lives in the tooltip and the commit
+                                    // header. The author keeps up to half the line; chips
+                                    // truncate first, so nothing overflows the row.
                                     .child(
                                         div()
                                             .h(px(chrome::DETAIL_LINE_HEIGHT))
                                             .min_w_0()
+                                            .overflow_hidden()
                                             .flex()
                                             .items_center()
                                             .gap(px(6.0))
                                             .text_size(px(chrome::DETAIL_TEXT_SIZE))
                                             .line_height(px(chrome::DETAIL_LINE_HEIGHT))
                                             .text_color(theme::ash())
-                                            .child(div().flex_1().min_w_0().truncate().child(
-                                                format!("{} · {}", commit.author, commit.time()),
-                                            ))
-                                            .when(commit.head, |line| {
-                                                line.child(ref_chip(None, "HEAD".into()))
-                                            })
-                                            .when_some(upstream, |line, upstream| {
-                                                line.child(ref_chip(
-                                                    Some("icons/branch.svg"),
-                                                    upstream,
-                                                ))
-                                            })
                                             .child(
                                                 div()
                                                     .flex_shrink_0()
-                                                    .font_family(theme::mono())
-                                                    .child(commit.short_id().to_owned()),
-                                            ),
+                                                    .max_w(gpui::relative(0.5))
+                                                    .truncate()
+                                                    .child(commit.author.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .ml(px(-3.0))
+                                                    .child(format!("· {}", commit.time())),
+                                            )
+                                            .child(div().flex_1())
+                                            .when_some(head, |line, (label, branch)| {
+                                                line.child(ref_chip(label, branch, true))
+                                            })
+                                            .when_some(upstream, |line, upstream| {
+                                                line.child(ref_chip(upstream, true, false))
+                                            }),
                                     ),
                             ),
                     )
@@ -638,8 +668,12 @@ fn timeline(above: bool, below: bool, commit: Option<&workflow::CommitSummary>) 
     };
     let top = NODE_CENTER - NODE_SIZE / 2.0;
     let unpushed = commit.local == Some(true);
+    // Unpushed commits are filled; HEAD gets a heavier ring in the focus color so the
+    // current commit is findable by shape as well as tone.
     let tone = if unpushed {
         theme::success()
+    } else if commit.head {
+        theme::focus()
     } else {
         theme::ash()
     };
@@ -664,85 +698,35 @@ fn timeline(above: bool, below: bool, commit: Option<&workflow::CommitSummary>) 
         )
 }
 
-fn tint(color: gpui::Rgba, alpha: f32) -> gpui::Rgba {
-    gpui::Rgba { a: alpha, ..color }
-}
-
-/// Badge for a Conventional Commits prefix. Tone only reinforces the label text.
-fn prefix_badge(prefix: workflow::CommitPrefix<'_>) -> gpui::Div {
-    let kind = prefix.kind.to_ascii_lowercase();
-    let tone = match kind.as_str() {
-        _ if prefix.breaking => theme::error(),
-        "feat" => theme::success(),
-        "fix" | "hotfix" => theme::modified(),
-        "revert" => theme::error(),
-        _ => theme::ash(),
-    };
+/// Branch label at the end of a commit's meta line. The checked-out branch is filled and
+/// uses the full text color; a tracking branch is outlined and muted, so the two differ by
+/// shape as well as tone.
+fn ref_chip(label: String, branch: bool, current: bool) -> gpui::Div {
+    let tone = if current { theme::bone() } else { theme::ash() };
     div()
-        .flex_shrink_0()
-        .max_w(px(128.0))
-        .h(px(18.0))
-        .px(px(5.0))
-        .flex()
-        .items_center()
-        .gap(px(4.0))
-        .overflow_hidden()
-        .rounded(px(3.0))
-        .border_1()
-        .border_color(tint(tone, 0.32))
-        .bg(tint(tone, 0.12))
-        .font_family(theme::mono())
-        .text_size(px(10.0))
-        .line_height(px(14.0))
-        .text_color(tone)
-        .child(div().flex_shrink_0().child(kind))
-        .when_some(prefix.scope, |badge, scope| {
-            badge
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .w(px(1.0))
-                        .h(px(10.0))
-                        .bg(tint(tone, 0.32)),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(tint(tone, 0.72))
-                        .child(scope.to_owned()),
-                )
-        })
-        .when(prefix.breaking, |badge| {
-            badge.child(div().flex_shrink_0().child("!"))
-        })
-}
-
-/// Neutral reference label such as `HEAD` or the upstream branch.
-fn ref_chip(icon: Option<&'static str>, label: String) -> gpui::Div {
-    div()
-        .flex_shrink_0()
-        .max_w(px(112.0))
+        .min_w_0()
+        .max_w(px(120.0))
         .h(px(chrome::DETAIL_LINE_HEIGHT))
-        .px(px(4.0))
+        .px(px(5.0))
         .flex()
         .items_center()
         .gap(px(3.0))
         .overflow_hidden()
-        .rounded(px(3.0))
-        .border_1()
-        .border_color(theme::edge())
-        .font_family(theme::mono())
-        .text_size(px(10.0))
+        .rounded(px(4.0))
+        .when(current, |chip| chip.bg(tint(theme::focus(), 0.16)))
+        .when(!current, |chip| chip.border_1().border_color(theme::edge()))
+        .font_family(chrome::CHROME_FONT)
+        .text_size(px(10.5))
         .line_height(px(14.0))
-        .text_color(theme::ash())
-        .when_some(icon, |chip, icon| {
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(tone)
+        .when(branch, |chip| {
             chip.child(
                 svg()
-                    .path(icon)
+                    .path("icons/branch.svg")
                     .size(px(10.0))
                     .flex_shrink_0()
-                    .text_color(theme::ash()),
+                    .text_color(tone),
             )
         })
         .child(div().min_w_0().truncate().child(label))
@@ -778,7 +762,8 @@ mod tests {
                 author: "Example Developer".into(),
                 timestamp: 0,
                 date: "2026-09-14 14:32".into(),
-                subject: "Example commit".into(),
+                // Exercises the prefix badge, inline code, and HEAD chip in one row.
+                subject: "fix(ui): keep `focus` visible".into(),
                 body: "A commit body".into(),
                 local: Some(true),
                 head: true,

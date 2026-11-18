@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::HashSet;
+use std::ops::Range;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CommitSummary {
@@ -72,6 +73,34 @@ fn conventional_prefix(subject: &str) -> Option<CommitPrefix<'_>> {
         breaking,
         summary,
     })
+}
+
+/// Splits `` `code` `` spans out of a subject line. The backticks are dropped and
+/// the ranges index the returned text. Unmatched or empty pairs stay literal, and
+/// `None` means the subject has no spans, so callers can render it unchanged.
+pub(crate) fn inline_code(subject: &str) -> Option<(String, Vec<Range<usize>>)> {
+    let mut text = String::with_capacity(subject.len());
+    let mut spans = Vec::new();
+    let mut rest = subject;
+    while let Some(open) = rest.find('`') {
+        let after = &rest[open + 1..];
+        match after.find('`') {
+            Some(0) => {
+                text.push_str(&rest[..open + 2]);
+                rest = &after[1..];
+            }
+            Some(close) => {
+                text.push_str(&rest[..open]);
+                let start = text.len();
+                text.push_str(&after[..close]);
+                spans.push(start..text.len());
+                rest = &after[close + 1..];
+            }
+            None => break,
+        }
+    }
+    text.push_str(rest);
+    (!spans.is_empty()).then_some((text, spans))
 }
 
 /// Days since 1970-01-01 for a proleptic Gregorian `YYYY-MM-DD` (Hinnant's days_from_civil).
@@ -428,6 +457,23 @@ mod tests {
         ] {
             assert_eq!(conventional_prefix(subject), None, "{subject}");
         }
+    }
+
+    #[test]
+    fn inline_code_spans_drop_backticks_and_leave_stray_ones_alone() {
+        let (text, spans) = inline_code("handle `None` in `parse` calls").unwrap();
+        assert_eq!(text, "handle None in parse calls");
+        let code: Vec<_> = spans.iter().map(|span| &text[span.clone()]).collect();
+        assert_eq!(code, ["None", "parse"]);
+        let (text, spans) = inline_code("caf\u{e9} `\u{754c}`").unwrap();
+        assert_eq!(&text[spans[0].clone()], "\u{754c}");
+        for subject in ["no code", "one stray ` tick", "empty `` pair", "`open"] {
+            assert_eq!(inline_code(subject), None, "{subject}");
+        }
+        // A stray tick before a real pair does not swallow the pair.
+        let (text, spans) = inline_code("`` then `x`").unwrap();
+        assert_eq!(text, "`` then x");
+        assert_eq!(&text[spans[0].clone()], "x");
     }
 
     #[test]

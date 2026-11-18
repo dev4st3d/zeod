@@ -542,6 +542,29 @@ pub(crate) fn diff_empty() -> Rgba {
     rgba(palette().diff_empty)
 }
 
+// Changed words sit on a stronger fill of the same hue as their row. The weight
+// is a compromise: enough lift to read at a glance, little enough that syntax
+// colors keep at least 3:1 on the fill and `bone` keeps 4.5:1.
+const DIFF_EMPHASIS_WEIGHT: f32 = 0.2;
+
+fn blend(base: u32, tone: u32, weight: f32) -> u32 {
+    let channel = |shift: u32| {
+        let base = ((base >> shift) & 0xff) as f32;
+        let tone = ((tone >> shift) & 0xff) as f32;
+        (base + (tone - base) * weight).round() as u32
+    };
+    (channel(24) << 24) | (channel(16) << 16) | (channel(8) << 8) | 0xff
+}
+
+pub(crate) fn diff_added_emphasis() -> Rgba {
+    let p = palette();
+    rgba(blend(p.diff_added, p.success, DIFF_EMPHASIS_WEIGHT))
+}
+pub(crate) fn diff_removed_emphasis() -> Rgba {
+    let p = palette();
+    rgba(blend(p.diff_removed, p.error, DIFF_EMPHASIS_WEIGHT))
+}
+
 const ANSI_LIGHT: [u32; 16] = [
     0x242424ff, 0x9e3238ff, 0x2f6843ff, 0x765b00ff, 0x315ea3ff, 0x854080ff, 0x226d70ff, 0x616161ff,
     0x616161ff, 0xb13c40ff, 0x316c45ff, 0x7d6000ff, 0x395f9bff, 0x90518aff, 0x267076ff, 0x494949ff,
@@ -609,6 +632,15 @@ mod tests {
                 assert!(
                     contrast(p.ash, background) >= muted_diff_minimum,
                     "{appearance:?}"
+                );
+            }
+            for (row, tone) in [(p.diff_added, p.success), (p.diff_removed, p.error)] {
+                let emphasis = blend(row, tone, DIFF_EMPHASIS_WEIGHT);
+                assert!(contrast(p.bone, emphasis) >= 4.5, "{appearance:?}");
+                assert!(contrast(p.ash, emphasis) >= 3.0, "{appearance:?}");
+                assert!(
+                    contrast(emphasis, row) > 1.0,
+                    "{appearance:?}: emphasis must differ from its row"
                 );
             }
             assert!(contrast(p.error, p.error_wash) >= 4.5, "{appearance:?}");

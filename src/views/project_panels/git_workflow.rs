@@ -8,6 +8,7 @@ enum WriteAction {
     Push(workflow::PushPlan),
     Fetch(workflow::Repository, String),
     Discard(workflow::DiscardPlan),
+    Init,
 }
 
 impl WriteAction {
@@ -19,6 +20,7 @@ impl WriteAction {
             Self::Push(..) => "Pushing…",
             Self::Fetch(..) => "Fetching…",
             Self::Discard(..) => "Discarding…",
+            Self::Init => "Initializing…",
         }
     }
     fn run(self, root: &std::path::Path) -> Result<String, String> {
@@ -45,6 +47,7 @@ impl WriteAction {
                     "Unstaged changes discarded.".into()
                 }
             }),
+            Self::Init => workflow::init(root).map(|()| "Git repository created.".into()),
         }
     }
 }
@@ -61,7 +64,10 @@ impl GitPanel {
         let Some(terminal) = self.terminal.upgrade() else {
             return;
         };
-        let allow_dirty = matches!(action, WriteAction::Push(_) | WriteAction::Fetch(..));
+        let allow_dirty = matches!(
+            action,
+            WriteAction::Push(_) | WriteAction::Fetch(..) | WriteAction::Init
+        );
         if !terminal.update(cx, |terminal, cx| {
             terminal.begin_file_change(allow_dirty, cx)
         }) {
@@ -72,7 +78,7 @@ impl GitPanel {
             return;
         }
         let is_commit = matches!(action, WriteAction::Commit(..));
-        let changes_disk = matches!(action, WriteAction::Discard(_));
+        let changes_disk = matches!(action, WriteAction::Discard(_) | WriteAction::Init);
         self.operation = Some(action.label());
         self.operation_error = None;
         self.notice = None;
@@ -123,6 +129,13 @@ impl GitPanel {
             return;
         }
         self.perform_git(WriteAction::Stage(entries, staged), window, cx);
+    }
+
+    fn initialize_repository(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.not_repository || self.loading {
+            return;
+        }
+        self.perform_git(WriteAction::Init, window, cx);
     }
 
     pub(super) fn commit_staged(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -365,6 +378,56 @@ pub(super) fn git_control(
             control.child(svg().path(icon).size(px(14.0)).text_color(theme::ash()))
         })
         .when(!label.is_empty(), |control| control.child(label))
+}
+
+/// Accent action; falls back to a quiet outline while unavailable.
+fn git_primary(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    icon: &'static str,
+    enabled: bool,
+) -> gpui::Stateful<gpui::Div> {
+    let foreground = if enabled {
+        theme::on_accent()
+    } else {
+        theme::ash()
+    };
+    div()
+        .id(id)
+        .h(px(28.0))
+        .px(px(12.0))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(6.0))
+        .rounded(px(4.0))
+        .border_1()
+        .text_size(px(12.0))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(foreground)
+        .when(enabled, |button| {
+            button
+                .border_color(theme::focus())
+                .bg(theme::focus())
+                .tab_index(0)
+                .cursor_pointer()
+                .hover(|style| {
+                    style
+                        .bg(theme::accent_hover())
+                        .border_color(theme::accent_hover())
+                })
+                .focus(|style| style.border_color(theme::on_accent()))
+        })
+        .when(!enabled, |button| button.border_color(theme::edge()))
+        .child(
+            svg()
+                .path(icon)
+                .size(px(14.0))
+                .flex_shrink_0()
+                .text_color(foreground),
+        )
+        .child(label.into())
 }
 
 pub(super) fn git_quiet(control: gpui::Stateful<gpui::Div>) -> gpui::Stateful<gpui::Div> {
@@ -1015,125 +1078,201 @@ impl GitPanel {
             .into_any_element()
     }
 
-    fn composer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// Commit card: a borderless message field over a footer that carries the
+    /// staged count and the commit and push actions, so they read as one unit.
+    fn composer(&self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let staged = self.status.as_ref().map_or(0, |status| {
             status.entries.iter().filter(|entry| entry.staged()).count()
         });
         let can_commit = self.can_commit(cx);
-        let can_push = self.can_push();
-        let commit_label = if self.operation == Some("Committing…") {
-            "Committing…".to_string()
-        } else if staged == 0 {
-            "Commit".to_string()
-        } else {
-            format!("Commit {staged}")
+        let committing = self.operation == Some("Committing…");
+        let pushing = self.operation == Some("Pushing…");
+        let show_push = pushing || self.can_push();
+        let focused =
+            gpui::Focusable::focus_handle(self.commit_input.read(cx), cx).is_focused(window);
+        let summary = match staged {
+            0 => "Nothing staged".to_owned(),
+            count => format!("{count} staged"),
         };
         div()
-            .px(px(12.0))
-            .pt(px(12.0))
-            .pb(px(12.0))
+            .p(px(12.0))
             .flex_shrink_0()
-            .flex()
-            .flex_col()
-            .gap(px(8.0))
             .border_t_1()
             .border_color(theme::edge())
             .child(
-                Input::new(&self.commit_input)
-                    .h(px(56.0))
-                    .disabled(self.git_busy())
-                    .font_family(chrome::CHROME_FONT)
-                    .text_size(px(13.0))
-                    .bg(theme::canvas())
-                    .border_color(theme::edge()),
-            )
-            .child(
                 div()
-                    .h(px(32.0))
                     .flex()
-                    .rounded(px(4.0))
-                    .overflow_hidden()
+                    .flex_col()
+                    .rounded(px(6.0))
                     .border_1()
-                    .border_color(theme::edge())
-                    .bg(theme::chrome())
+                    .border_color(if focused {
+                        theme::focus()
+                    } else {
+                        theme::edge()
+                    })
+                    .bg(theme::canvas())
+                    .when(!focused, |card| {
+                        card.hover(|style| style.border_color(theme::edge_hard()))
+                    })
                     .child(
-                        div()
-                            .id("git-commit")
-                            .h_full()
-                            .flex_1()
-                            .min_w_0()
-                            .px(px(12.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap(px(8.0))
-                            .border_r_1()
-                            .border_color(theme::edge())
-                            .text_size(px(12.0))
-                            .bg(if can_commit { theme::focus() } else { rgba(0) })
-                            .text_color(if can_commit {
-                                theme::on_accent()
-                            } else {
-                                theme::ash()
-                            })
-                            .tooltip(text_tooltip(if can_commit {
-                                "Commit staged changes · Ctrl+Enter"
-                            } else {
-                                "Write a message and stage changes to commit. Resolve any conflicts first."
-                            }))
-                            .when(can_commit, |button| {
-                                button
-                                    .tab_index(0)
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(theme::accent_hover()))
-                                    .focus(|style| style.bg(theme::accent_pressed()))
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        view.commit_staged(window, cx)
-                                    }))
-                            })
-                            .when(can_commit, |button| {
-                                button.child(
-                                    svg()
-                                        .path("icons/check.svg")
-                                        .size(px(14.0))
-                                        .flex_shrink_0()
-                                        .text_color(theme::on_accent()),
-                                )
-                            })
-                            .child(div().min_w_0().truncate().child(commit_label)),
+                        Input::new(&self.commit_input)
+                            .appearance(false)
+                            .bordered(false)
+                            .h(px(52.0))
+                            .px(px(10.0))
+                            .pt(px(8.0))
+                            .pb_0()
+                            .disabled(self.git_busy())
+                            .font_family(chrome::CHROME_FONT)
+                            .text_size(px(13.0)),
                     )
                     .child(
                         div()
-                            .id("git-push")
-                            .h_full()
-                            .px(px(12.0))
-                            .flex_shrink_0()
+                            .h(px(40.0))
+                            .pl(px(10.0))
+                            .pr(px(6.0))
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .gap(px(6.0))
-                            .text_size(px(12.0))
-                            .text_color(if can_push { theme::bone() } else { theme::ash() })
-                            .tooltip(text_tooltip(self.push_tooltip()))
-                            .when(can_push, |button| {
-                                button
-                                    .tab_index(0)
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(theme::panel_hover()))
-                                    .focus(|style| style.bg(theme::selection()))
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        view.push_current(None, window, cx)
-                                    }))
-                            })
+                            .gap(px(4.0))
                             .child(
-                                svg()
-                                    .path("icons/arrow-up.svg")
-                                    .size(px(14.0))
-                                    .flex_shrink_0()
-                                    .text_color(theme::ash()),
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(chrome::DETAIL_TEXT_SIZE))
+                                    .line_height(px(chrome::DETAIL_LINE_HEIGHT))
+                                    .text_color(theme::ash())
+                                    .child(summary),
                             )
-                            .child(self.push_label()),
+                            .when(show_push, |footer| footer.child(self.composer_push(cx)))
+                            .child(self.composer_commit(can_commit, committing, cx)),
                     ),
+            )
+            .into_any_element()
+    }
+
+    /// Quiet footer action; hidden when there is nothing to push.
+    fn composer_push(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let pushing = self.operation == Some("Pushing…");
+        div()
+            .id("git-push")
+            .h(px(28.0))
+            .px(px(8.0))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(rgba(0))
+            .text_size(px(12.0))
+            .text_color(if pushing {
+                theme::ash()
+            } else {
+                theme::bone_dim()
+            })
+            .tooltip(text_tooltip(self.push_tooltip()))
+            .when(!pushing, |button| {
+                button
+                    .tab_index(0)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::panel_hover()).text_color(theme::bone()))
+                    .focus(|style| style.border_color(theme::focus()))
+                    .on_click(
+                        cx.listener(|view, _, window, cx| view.push_current(None, window, cx)),
+                    )
+            })
+            .child(
+                svg()
+                    .path("icons/arrow-up.svg")
+                    .size(px(14.0))
+                    .flex_shrink_0()
+                    .text_color(theme::ash()),
+            )
+            .child(self.push_label())
+            .into_any_element()
+    }
+
+    fn composer_commit(
+        &self,
+        can_commit: bool,
+        committing: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        git_primary(
+            "git-commit",
+            if committing {
+                "Committing…"
+            } else {
+                "Commit"
+            },
+            "icons/check.svg",
+            can_commit,
+        )
+        .tooltip(text_tooltip(if can_commit {
+            "Commit staged changes · Ctrl+Enter"
+        } else {
+            "Write a message and stage changes to commit. Resolve any conflicts first."
+        }))
+        .when(can_commit, |button| {
+            button.on_click(cx.listener(|view, _, window, cx| view.commit_staged(window, cx)))
+        })
+        .into_any_element()
+    }
+
+    /// Shown instead of a status error when the project has no repository yet.
+    fn init_state(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let initializing = self.operation == Some("Initializing…");
+        let enabled = !self.git_busy() && !self.loading;
+        div()
+            .flex_1()
+            .min_h_0()
+            .px(px(24.0))
+            .pb(px(40.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(4.0))
+            .text_center()
+            .child(
+                svg()
+                    .path("icons/branch.svg")
+                    .mb(px(4.0))
+                    .size(px(20.0))
+                    .text_color(theme::ash()),
+            )
+            .child(
+                div()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child("No Git repository"),
+            )
+            .child(
+                div()
+                    .text_size(px(chrome::DETAIL_TEXT_SIZE))
+                    .line_height(px(chrome::DETAIL_LINE_HEIGHT))
+                    .text_color(theme::ash())
+                    .child("Initialize one to track changes in this folder."),
+            )
+            .child(
+                git_primary(
+                    "git-init",
+                    if initializing {
+                        "Initializing…"
+                    } else {
+                        "Initialize repository"
+                    },
+                    "icons/plus.svg",
+                    enabled,
+                )
+                .mt(px(12.0))
+                .h(px(32.0))
+                .tooltip(text_tooltip("Run git init in this project folder"))
+                .when(enabled, |button| {
+                    button.on_click(
+                        cx.listener(|view, _, window, cx| view.initialize_repository(window, cx)),
+                    )
+                }),
             )
             .into_any_element()
     }
@@ -1232,7 +1371,7 @@ impl GitPanel {
 
     pub(super) fn render_git_panel(
         &self,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let count = self.change_count().unwrap_or(0);
@@ -1376,6 +1515,8 @@ impl GitPanel {
             })
             .child(if self.history.visible {
                 self.render_history_list(cx)
+            } else if self.not_repository {
+                self.init_state(cx)
             } else if count == 0 && self.error.is_none() {
                 self.clean_state(cx)
             } else {
@@ -1403,7 +1544,9 @@ impl GitPanel {
                     )
                     .into_any_element()
             })
-            .when_some(self.error.clone(), |panel, error| {
+            .when_some(
+                self.error.clone().filter(|_| !self.not_repository),
+                |panel, error| {
                 panel.child(
                     div()
                         .p(px(12.0))
@@ -1429,8 +1572,8 @@ impl GitPanel {
                 )
             })
             .child(self.operation_feedback(cx))
-            .when(!self.history.visible, |panel| {
-                panel.child(self.composer(cx))
+            .when(!self.history.visible && !self.not_repository, |panel| {
+                panel.child(self.composer(window, cx))
             })
             .into_any_element()
     }

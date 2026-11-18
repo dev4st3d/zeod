@@ -1,5 +1,6 @@
 use super::*;
 use crate::services::project_git::{GitLineStats, workflow::CommitDetails};
+use crate::views::commit_text;
 
 fn stats(value: Option<GitLineStats>) -> gpui::AnyElement {
     div()
@@ -55,6 +56,7 @@ impl DiffView {
 
     fn commit_header(&self, commit: &CommitDetails, cx: &mut Context<Self>) -> gpui::AnyElement {
         let summary = &commit.summary;
+        let prefix = summary.prefix();
         let parent_label = if commit.parent.is_none() {
             "Empty tree".into()
         } else if summary.parents.len() > 1 {
@@ -81,15 +83,30 @@ impl DiffView {
                     .gap(px(8.0))
                     .child(
                         div()
+                            .id("commit-subject")
                             .flex_1()
                             .min_w_0()
-                            .truncate()
-                            .text_size(px(14.0))
-                            .line_height(px(20.0))
-                            .font_weight(FontWeight::MEDIUM)
-                            .id("commit-subject")
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
                             .tooltip(text_tooltip(summary.subject.clone()))
-                            .child(summary.subject.clone()),
+                            .when_some(prefix, |line, prefix| {
+                                line.child(commit_text::prefix_badge(prefix))
+                            })
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(14.0))
+                                    .line_height(px(20.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(commit_text::subject(
+                                        prefix.map_or(summary.subject.as_str(), |prefix| {
+                                            prefix.summary
+                                        }),
+                                    )),
+                            ),
                     )
                     .when(summary.local == Some(true), |row| {
                         row.child(
@@ -215,7 +232,8 @@ impl DiffView {
                                 .flex_1()
                                 .min_w_0()
                                 .text_size(px(12.0))
-                                .text_color(theme::ash())
+                                .line_height(px(18.0))
+                                .text_color(theme::bone())
                                 .max_h(px(120.0))
                                 .overflow_y_scroll()
                                 .child(summary.body.clone()),

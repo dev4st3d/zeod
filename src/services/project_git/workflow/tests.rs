@@ -68,6 +68,24 @@ impl Repo {
 }
 
 #[test]
+fn init_turns_a_plain_folder_into_an_unborn_repository() {
+    let repo = Repo::new();
+    let folder = repo.0.join("plain");
+    fs::create_dir(&folder).unwrap();
+    // Detach the fixture's own repository so the folder reads as plain.
+    fs::remove_dir_all(repo.0.join(".git")).unwrap();
+    assert!(matches!(read_status(&folder), Err(GitError::NotRepository)));
+
+    init(&folder).unwrap();
+
+    let status = read_status(&folder).unwrap();
+    assert!(status.entries.is_empty());
+    let created = repository(&folder).unwrap();
+    assert_eq!(created.head, None);
+    assert!(created.remotes.is_empty());
+}
+
+#[test]
 fn literal_staging_and_unborn_unstage_preserve_working_files_and_new_line_counts() {
     let repo = Repo::new();
     repo.put("a[1].txt", "first\nsecond\n");

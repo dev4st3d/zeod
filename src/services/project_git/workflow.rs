@@ -8,7 +8,7 @@ pub(crate) use history::CommitFile;
 mod tests;
 pub(crate) use history::{
     CommitDetails, CommitPrefix, CommitSummary, commit_details, commit_file_diff, day_label,
-    history_page,
+    history_page, inline_code,
 };
 const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) const HISTORY_PAGE_SIZE: usize = 40;
@@ -218,6 +218,17 @@ fn literal(path: &Path) -> OsString {
     let mut value = OsString::from(":(literal)");
     value.push(path);
     value
+}
+
+/// Creates an empty repository in `project`. Offered only after a status read
+/// found no enclosing repository; rerunning on an existing one is harmless.
+pub(crate) fn init(project: &Path) -> Result<(), String> {
+    write(
+        project,
+        &args(&["init", "--quiet"]),
+        None,
+        "Could not create a Git repository. Check the folder's permissions, then retry.",
+    )
 }
 
 pub(crate) fn stage(project: &Path, entries: &[GitEntry], staged: bool) -> Result<(), String> {

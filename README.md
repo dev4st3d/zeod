@@ -19,7 +19,7 @@ Installed builds check GitHub Releases for updates, and restart only after you c
 - **Git built in.** Stage, commit, push, and browse history, with unified and split diffs.
 - **Terminals that stay put.** They start in the project directory and keep running when you switch tabs or projects.
 - **Panes.** Show one to four at once and rearrange them by dragging.
-- **A checklist per project** for small to-dos.
+- **Reminders per project** for small to-dos.
 - **Ten themes** and shortcuts you can change in Settings.
 
 Your theme, font, shortcuts, and layout stay on your machine. Zeod has no telemetry or analytics.

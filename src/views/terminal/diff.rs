@@ -23,6 +23,8 @@ const MIN_FOLD_LINES: usize = 4;
 
 #[path = "diff_review.rs"]
 mod review;
+#[path = "diff_words.rs"]
+mod words;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Line {
@@ -30,6 +32,8 @@ struct Line {
     text: String,
     display: SharedString,
     changed: bool,
+    /// Byte ranges of `text` that differ from the paired line on the other side.
+    emphasis: Vec<Range<usize>>,
 }
 
 impl Line {
@@ -39,6 +43,7 @@ impl Line {
             text: text.to_owned(),
             display: SharedString::new(text.replace('\t', "    ")),
             changed,
+            emphasis: Vec::new(),
         }
     }
 }
@@ -126,9 +131,20 @@ fn flush_changes(rows: &mut Vec<Row>, before: &mut Vec<Line>, after: &mut Vec<Li
     let count = before.len().max(after.len());
     let mut before = before.drain(..);
     let mut after = after.drain(..);
-    rows.extend((0..count).map(|_| Row {
-        before: before.next(),
-        after: after.next(),
+    rows.extend((0..count).map(|_| {
+        let (mut old, mut new) = (before.next(), after.next());
+        // Replacements pair by position; only lines that are clearly edits of
+        // each other get word emphasis.
+        if let (Some(old), Some(new)) = (&mut old, &mut new)
+            && let Some(changes) = words::changes(&old.text, &new.text)
+        {
+            old.emphasis = changes.before;
+            new.emphasis = changes.after;
+        }
+        Row {
+            before: old,
+            after: new,
+        }
     }));
 }
 
@@ -547,13 +563,37 @@ impl DiffView {
         let Some(line) = line else {
             return SharedString::new_static("").into_any_element();
         };
-        let spans = match (&self.syntax, cx.try_global::<Theme>()) {
+        let syntax = match (&self.syntax, cx.try_global::<Theme>()) {
             (Some(syntax), Some(theme)) => {
                 let side = if right { &syntax.after } else { &syntax.before };
                 expand_tabs(&line.text, side.styles(index, &theme.highlight_theme))
             }
             _ => Vec::new(),
         };
+        // Changed words add a fill under the syntax colors rather than replacing them.
+        let emphasis = if line.emphasis.is_empty() {
+            Vec::new()
+        } else {
+            let fill = HighlightStyle {
+                background_color: Some(
+                    if right {
+                        theme::diff_added_emphasis()
+                    } else {
+                        theme::diff_removed_emphasis()
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            };
+            expand_tabs(
+                &line.text,
+                line.emphasis
+                    .iter()
+                    .map(|range| (range.clone(), fill))
+                    .collect(),
+            )
+        };
+        let spans: Vec<_> = gpui::combine_highlights(syntax, emphasis).collect();
         if spans.is_empty() {
             line.display.clone().into_any_element()
         } else {
@@ -747,15 +787,18 @@ impl DiffView {
         };
         let number =
             |line: Option<&Line>| line.map_or_else(String::new, |line| line.number.to_string());
+        // Changed lines get a brighter number and a sign, so a change reads
+        // without relying on the row tint alone.
         let gutter = |value: String| {
             div()
                 .w(px(44.0))
                 .flex_shrink_0()
                 .pr(px(12.0))
                 .text_right()
-                .text_color(theme::ash())
+                .text_color(if changed { theme::bone() } else { theme::ash() })
                 .child(value)
         };
+        let sign = changed.then_some(if right { "+" } else { "−" });
         div()
             .id((if right { "diff-after" } else { "diff-before" }, index))
             .debug_selector(move || format!("diff-{index}-{right}"))
@@ -791,6 +834,21 @@ impl DiffView {
                     .child(gutter(number(before)))
             })
             .child(gutter(number(if self.split { line } else { after })))
+            .child(
+                div()
+                    .w(px(16.0))
+                    .flex_shrink_0()
+                    .text_center()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(if selected {
+                        theme::bone()
+                    } else if right {
+                        theme::success()
+                    } else {
+                        theme::error()
+                    })
+                    .children(sign),
+            )
             .child({
                 let mut code = div()
                     .id((
@@ -1354,6 +1412,27 @@ mod tests {
         assert!(
             matches!(&section.rows[3], Row { before: Some(before), after: Some(after) } if before.number == 44 && after.number == 45 && !before.changed)
         );
+    }
+
+    #[test]
+    fn paired_replacements_carry_word_emphasis_and_rewrites_do_not() {
+        let sections = parse(
+            "@@ -1,3 +1,3 @@\n-let total = count(1);\n-fn parse(input: &str)\n-removed only\n+let total = count(2);\n+struct Cache { entries: Vec<u8> }\n context\n",
+        );
+        let rows = &sections[0].rows;
+        let (Some(old), Some(new)) = (&rows[0].before, &rows[0].after) else {
+            panic!("the first replacement must keep both sides");
+        };
+        assert_eq!(&old.text[old.emphasis[0].clone()], "1");
+        assert_eq!(&new.text[new.emphasis[0].clone()], "2");
+        // Unrelated lines keep only the row tint.
+        let (Some(old), Some(new)) = (&rows[1].before, &rows[1].after) else {
+            panic!("the second replacement must keep both sides");
+        };
+        assert!(old.emphasis.is_empty() && new.emphasis.is_empty());
+        // Unpaired deletions and context are never emphasized.
+        assert!(rows[2].before.as_ref().unwrap().emphasis.is_empty());
+        assert!(rows[3].before.as_ref().unwrap().emphasis.is_empty());
     }
 
     #[test]

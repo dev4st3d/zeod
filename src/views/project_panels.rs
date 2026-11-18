@@ -927,6 +927,8 @@ pub(super) struct GitPanel {
     diff_generation: u64,
     diff_loading: Option<PathBuf>,
     error: Option<String>,
+    /// The last status read found no enclosing repository; offer `git init`.
+    not_repository: bool,
     selected: usize,
     selection_visible: bool,
     focus: FocusHandle,
@@ -966,7 +968,7 @@ impl GitPanel {
             InputState::new(window, cx)
                 .multi_line(true)
                 .rows(2)
-                .placeholder("Commit message · Ctrl+Enter")
+                .placeholder("Commit message")
         });
         let subscription = cx.subscribe_in(
             &commit_input,
@@ -1006,6 +1008,7 @@ impl GitPanel {
             diff_generation: 0,
             diff_loading: None,
             error: None,
+            not_repository: false,
             selected: 0,
             selection_visible: false,
             focus: cx.focus_handle(),
@@ -1038,10 +1041,15 @@ impl GitPanel {
         self.error = None;
         let root = self.root.clone();
         let task = cx.background_executor().spawn(async move {
-            let status = project_git::read_status(&root).map_err(|e| e.to_string())?;
-            let branches = project_git::branches(&root).map_err(|e| e.to_string())?;
-            let repository = workflow::repository(&root)?;
-            Ok::<_, String>((status, branches, repository))
+            let status = project_git::read_status(&root).map_err(|error| {
+                (
+                    error == project_git::GitError::NotRepository,
+                    error.to_string(),
+                )
+            })?;
+            let branches = project_git::branches(&root).map_err(|e| (false, e.to_string()))?;
+            let repository = workflow::repository(&root).map_err(|e| (false, e))?;
+            Ok::<_, (bool, String)>((status, branches, repository))
         });
         cx.spawn(async move |view, cx| {
             let result = task.await;
@@ -1052,6 +1060,7 @@ impl GitPanel {
                 view.loading = false;
                 match result {
                     Ok((status, branches, repository)) => {
+                        view.not_repository = false;
                         let changed = view.repository.as_ref().is_none_or(|old| {
                             old.head != repository.head
                                 || old.upstream != repository.upstream
@@ -1069,7 +1078,17 @@ impl GitPanel {
                             view.refresh_active_review(cx);
                         }
                     }
-                    Err(error) => view.error = Some(error),
+                    Err((missing, error)) => {
+                        view.not_repository = missing;
+                        if missing {
+                            // A removed `.git` must not leave stale branch or change state behind.
+                            view.repository = None;
+                            view.status = None;
+                            view.branches.clear();
+                            view.rebuild_changes();
+                        }
+                        view.error = Some(error);
+                    }
                 }
                 if view.refresh_pending {
                     view.refresh(cx);

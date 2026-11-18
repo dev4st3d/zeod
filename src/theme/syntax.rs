@@ -112,7 +112,10 @@ pub(crate) fn colors() -> SyntaxColors {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::{Appearance, canvas, diff_added, diff_removed, selection, set_appearance};
+    use crate::theme::{
+        Appearance, canvas, diff_added, diff_added_emphasis, diff_removed, diff_removed_emphasis,
+        selection, set_appearance,
+    };
 
     const ROLES: [&str; 32] = [
         "comment",
@@ -225,10 +228,14 @@ mod tests {
                 let dimmed = role.starts_with("comment") || role == "tag.doctype";
                 // A selection is transient and keeps `bone` and `ash` at 4.5:1,
                 // so colored tokens only need 3:1 there.
+                // Changed words keep the same 3:1 floor as a selection; `bone`
+                // stays at 4.5:1 there, so plain code is never the weak spot.
                 let surfaces = [
                     (canvas(), 4.5),
                     (diff_added(), 4.5),
                     (diff_removed(), 4.5),
+                    (diff_added_emphasis(), 3.0),
+                    (diff_removed_emphasis(), 3.0),
                     (selection(), 3.0),
                 ];
                 for (background, minimum) in surfaces {
