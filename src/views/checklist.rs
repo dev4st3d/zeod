@@ -406,6 +406,7 @@ impl ChecklistView {
             .id(SharedString::from(format!(
                 "checklist-row-{s}-{task_index:?}"
             )))
+            .group("checklist-row")
             .debug_selector(move || format!("checklist-row-{s}-{task_index:?}").into())
             .h(px(if task.is_none() {
                 chrome::CHECKLIST_HEADING_HEIGHT
@@ -621,7 +622,14 @@ impl ChecklistView {
                         )),
                 )
             })
-            .child(self.menu(selection, cx))
+            .child(
+                // Row actions stay quiet until the row is hovered or selected.
+                div()
+                    .flex_shrink_0()
+                    .when(!selected, |slot| slot.invisible())
+                    .group_hover("checklist-row", |slot| slot.visible())
+                    .child(self.menu(selection, cx)),
+            )
             .into_any_element()
     }
 }
@@ -672,6 +680,7 @@ fn footer_action(
     tooltip: &'static str,
 ) -> Stateful<Div> {
     control(id)
+        .group(id)
         .debug_selector(move || id.into())
         .h(px(chrome::CHECKLIST_ROW_HEIGHT))
         .gap(px(chrome::CHECKLIST_GAP))
@@ -689,7 +698,8 @@ fn footer_action(
                 .path("icons/plus.svg")
                 .size(px(14.0))
                 .flex_shrink_0()
-                .text_color(theme::ash()),
+                .text_color(theme::ash())
+                .group_hover(id, |s| s.text_color(theme::bone())),
         )
         .child(label)
         .child(
@@ -880,6 +890,7 @@ impl ChecklistView {
             .child(div().flex_1().min_w_0().truncate().child(label))
             .child(
                 control("checklist-undo")
+                    .group("checklist-undo")
                     .h(px(28.0))
                     .px(px(7.0))
                     .gap(px(6.0))
@@ -892,12 +903,14 @@ impl ChecklistView {
                         svg()
                             .path("icons/undo.svg")
                             .size(px(12.0))
-                            .text_color(theme::ash()),
+                            .text_color(theme::ash())
+                            .group_hover("checklist-undo", |s| s.text_color(theme::bone())),
                     )
                     .child("Undo"),
             )
             .child(
                 control("checklist-undo-dismiss")
+                    .group("checklist-undo-dismiss")
                     .size(px(28.0))
                     .justify_center()
                     .tooltip(super::terminal_manager::text_tooltip("Dismiss"))
@@ -906,7 +919,13 @@ impl ChecklistView {
                         window.focus(&view.focus);
                         cx.notify();
                     }))
-                    .child(icon("close", 12.0)),
+                    .child(
+                        svg()
+                            .path("icons/close.svg")
+                            .size(px(12.0))
+                            .text_color(theme::ash())
+                            .group_hover("checklist-undo-dismiss", |s| s.text_color(theme::bone())),
+                    ),
             )
     }
 }

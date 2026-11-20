@@ -364,6 +364,7 @@ impl SettingsPanel {
             .child(
                 div()
                     .id("settings-close")
+                    .group("settings-close")
                     .size(px(chrome::CONTROL_HEIGHT))
                     .flex()
                     .items_center()
@@ -382,7 +383,8 @@ impl SettingsPanel {
                         svg()
                             .path("icons/close.svg")
                             .size(px(chrome::ICON_SIZE))
-                            .text_color(theme::ash()),
+                            .text_color(theme::ash())
+                            .group_hover("settings-close", |style| style.text_color(theme::bone())),
                     ),
             )
     }
@@ -394,6 +396,7 @@ impl SettingsPanel {
                 .id(id)
                 .h_full()
                 .px(px(chrome::CONTROL_INSET))
+                .pt(px(2.0))
                 .flex()
                 .items_center()
                 .border_b_2()
@@ -1006,7 +1009,6 @@ impl Render for SettingsPanel {
                     .border_1()
                     .border_color(theme::edge_hard())
                     .rounded(px(chrome::CONTROL_RADIUS))
-                    .shadow_lg()
                     .font_family(chrome::CHROME_FONT)
                     .font_weight(FontWeight::NORMAL)
                     .text_size(px(chrome::CONTROL_TEXT_SIZE))

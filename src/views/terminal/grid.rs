@@ -505,6 +505,7 @@ impl TerminalView {
                     .child(
                         div()
                             .id(("pane-close", index))
+                            .group("pane-close")
                             .size(px(chrome::PANE_CLOSE_SIZE))
                             .flex_shrink_0()
                             .flex()
@@ -528,7 +529,10 @@ impl TerminalView {
                                 svg()
                                     .path("icons/close.svg")
                                     .size(px(12.0))
-                                    .text_color(theme::ash()),
+                                    .text_color(theme::ash())
+                                    .group_hover("pane-close", |style| {
+                                        style.text_color(theme::bone())
+                                    }),
                             ),
                     )
             })

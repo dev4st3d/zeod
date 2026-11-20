@@ -290,6 +290,7 @@ impl Render for ImageViewer {
                     .child(
                         div()
                             .id("reload-image")
+                            .group("reload-image")
                             .size(px(26.0))
                             .flex_shrink_0()
                             .flex()
@@ -308,7 +309,10 @@ impl Render for ImageViewer {
                                 svg()
                                     .path("icons/refresh.svg")
                                     .size(px(14.0))
-                                    .text_color(theme::ash()),
+                                    .text_color(theme::ash())
+                                    .group_hover("reload-image", |style| {
+                                        style.text_color(theme::bone())
+                                    }),
                             ),
                     ),
             )

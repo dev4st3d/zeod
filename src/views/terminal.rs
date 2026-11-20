@@ -1297,6 +1297,7 @@ impl TerminalView {
             .child(
                 div()
                     .id("tab-list")
+                    .group("tab-list")
                     .size(px(chrome::TAB_LIST_BUTTON))
                     .flex()
                     .items_center()
@@ -1325,7 +1326,8 @@ impl TerminalView {
                                 "icons/chevron-down.svg"
                             })
                             .size(px(chrome::ICON_SIZE))
-                            .text_color(if open { theme::bone() } else { theme::ash() }),
+                            .text_color(if open { theme::bone() } else { theme::ash() })
+                            .group_hover("tab-list", |icon| icon.text_color(theme::bone())),
                     ),
             )
             .when(open, |wrapper| {
@@ -1641,6 +1643,7 @@ impl Render for TerminalView {
                     .child(
                         div()
                             .id("new-terminal")
+                            .group("new-terminal")
                             .debug_selector(|| "new-terminal".into())
                             .size(px(chrome::TAB_LIST_BUTTON))
                             .flex_shrink_0()
@@ -1663,13 +1666,21 @@ impl Render for TerminalView {
                                         cx.listener(|view, _, window, cx| view.add_tab(window, cx)),
                                     )
                             })
-                            .child(svg().path("icons/plus.svg").size(px(14.0)).text_color(
-                                if can_add_terminal {
-                                    theme::ash()
-                                } else {
-                                    theme::smoke()
-                                },
-                            )),
+                            .child(
+                                svg()
+                                    .path("icons/plus.svg")
+                                    .size(px(14.0))
+                                    .text_color(if can_add_terminal {
+                                        theme::ash()
+                                    } else {
+                                        theme::smoke()
+                                    })
+                                    .when(can_add_terminal, |icon| {
+                                        icon.group_hover("new-terminal", |style| {
+                                            style.text_color(theme::bone())
+                                        })
+                                    }),
+                            ),
                     )
                     .child(div().flex_1())
                     .child(layout_picker)
@@ -1746,6 +1757,7 @@ fn workspace_tab(
         .min_w(px(chrome::TAB_MIN_WIDTH))
         .pl(px(chrome::TAB_INSET))
         .pr(px(chrome::SMALL_GAP))
+        .pt(px(2.0))
         .flex_shrink_0()
         .flex()
         .flex_row()
@@ -1790,14 +1802,7 @@ fn workspace_tab(
         }))
         .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
         .on_click(cx.listener(move |view, _, window, cx| view.select_tab(select_id, window, cx)))
-        .child(if icon == "rs" {
-            div()
-                .font_family(theme::mono())
-                .text_size(px(13.0))
-                .text_color(theme::ash())
-                .child("rs")
-                .into_any_element()
-        } else {
+        .child(
             svg()
                 .path(icon)
                 .size(px(chrome::ICON_SIZE))
@@ -1807,8 +1812,10 @@ fn workspace_tab(
                 } else {
                     theme::ash()
                 })
-                .into_any_element()
-        })
+                .when(!selected, |icon| {
+                    icon.group_hover("workspace-tab", |style| style.text_color(theme::bone()))
+                }),
+        )
         .child(
             div()
                 .min_w_0()

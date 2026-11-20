@@ -9,12 +9,18 @@ pub(super) struct FileDrag {
 }
 impl Render for FileDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let count = self.paths.len();
         div()
             .px(px(10.0))
             .py(px(4.0))
-            .bg(theme::panel())
+            .rounded(px(chrome::CONTROL_RADIUS))
+            .border_1()
+            .border_color(theme::edge_hard())
+            .bg(theme::panel_lift())
+            .font_family(chrome::CHROME_FONT)
+            .text_size(px(12.0))
             .text_color(theme::bone())
-            .child(format!("{} item(s)", self.paths.len()))
+            .child(format!("{count} item{}", if count == 1 { "" } else { "s" }))
     }
 }
 
@@ -55,18 +61,30 @@ impl NameEdit {
         cx: &mut Context<FilesPanel>,
     ) -> impl IntoElement {
         div()
-            .px(px(chrome::TREE_INSET))
-            .py(px(4.0))
+            .mx(px(12.0))
+            .mb(px(8.0))
+            .p(px(8.0))
+            .rounded(px(chrome::CONTROL_RADIUS))
+            .border_1()
+            .border_color(theme::edge())
+            .bg(theme::chrome())
             .flex()
             .flex_col()
-            .gap(px(4.0))
-            .child(if self.source.is_some() {
-                "Rename"
-            } else if self.directory {
-                "New folder"
-            } else {
-                "New file"
-            })
+            .gap(px(6.0))
+            .child(
+                div()
+                    .text_size(px(chrome::DETAIL_TEXT_SIZE))
+                    .line_height(px(chrome::DETAIL_LINE_HEIGHT))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::bone_dim())
+                    .child(if self.source.is_some() {
+                        "Rename"
+                    } else if self.directory {
+                        "New folder"
+                    } else {
+                        "New file"
+                    }),
+            )
             .child(
                 Input::new(&self.input)
                     .h(px(32.0))
@@ -99,7 +117,7 @@ impl NameEdit {
             .child(
                 div()
                     .flex()
-                    .gap(px(8.0))
+                    .gap(px(6.0))
                     .child(control(
                         "Apply",
                         cx.listener(|view, _, window, cx| view.finish_name(window, cx)),
@@ -752,17 +770,20 @@ impl FilesPanel {
                         )
                     }),
             )
-            .child(
-                super::icon_control(
-                    "collapse-files",
-                    "Collapse all folders",
-                    "icons/collapse-all.svg",
+            .when(!self.expanded.is_empty(), |bar| {
+                bar.child(
+                    super::icon_control(
+                        "collapse-files",
+                        "Collapse all folders",
+                        "icons/collapse-all.svg",
+                    )
+                    .debug_selector(|| "collapse-files".into())
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        cx.stop_propagation();
+                        view.action(FileAction::Collapse, window, cx);
+                    })),
                 )
-                .on_click(cx.listener(|view, _, window, cx| {
-                    cx.stop_propagation();
-                    view.action(FileAction::Collapse, window, cx);
-                })),
-            )
+            })
             .child({
                 let owner = cx.weak_entity();
                 let show_hidden = !self.hide_hidden;
@@ -1090,7 +1111,7 @@ pub(super) fn control(
         .text_color(theme::ash())
         .cursor_pointer()
         .rounded(px(3.0))
-        .hover(|style| style.bg(theme::panel_hover()))
+        .hover(|style| style.bg(theme::panel_hover()).text_color(theme::bone()))
         .active(|style| style.bg(theme::selection()))
         .focus(|style| style.bg(theme::selection()).text_color(theme::focus()))
         .on_click(listener)

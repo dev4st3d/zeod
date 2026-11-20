@@ -778,6 +778,13 @@ impl Render for FilesPanel {
             .child(
                 div()
                     .id("project-root")
+                    .group("project-root")
+                    .mx(px(chrome::COMPACT_GAP))
+                    .pl(px(chrome::COMPACT_GAP))
+                    .pr(px(4.0))
+                    .rounded(px(ROW_RADIUS))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::panel_hover()))
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.root_collapsed = !view.root_collapsed;
                         window.focus(&view.focus);
@@ -815,14 +822,24 @@ impl Render for FilesPanel {
                     }))
                     .h(px(34.0))
                     .flex_shrink_0()
-                    .px(px(chrome::SIDEBAR_INSET))
                     .flex()
                     .items_center()
                     .gap(px(chrome::SMALL_GAP))
                     .text_size(px(12.0))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::bone())
-                    .child(panel_icon(if self.root_collapsed { "icons/chevron-right.svg" } else { "icons/chevron-down.svg" }))
+                    .child(
+                        svg()
+                            .path(if self.root_collapsed {
+                                "icons/chevron-right.svg"
+                            } else {
+                                "icons/chevron-down.svg"
+                            })
+                            .size(px(PANEL_ICON_SIZE))
+                            .flex_shrink_0()
+                            .text_color(theme::ash())
+                            .group_hover("project-root", |style| style.text_color(theme::bone())),
+                    )
                     .child(
                         div().flex_1().min_w_0().truncate().child(
                             self.root
@@ -1554,6 +1571,7 @@ fn git_marker(entry: &GitEntry) -> &'static str {
 
 pub(super) fn filter_field(input: &Entity<InputState>, top: f32, bottom: f32) -> impl IntoElement {
     div()
+        .debug_selector(|| "sidebar-filter".into())
         .mx(px(12.0))
         .mt(px(top))
         .mb(px(bottom))
@@ -1605,6 +1623,7 @@ pub(super) fn icon_control(
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
+        .group(id)
         .size(px(28.0))
         .flex_shrink_0()
         .flex()
@@ -1618,7 +1637,14 @@ pub(super) fn icon_control(
         .hover(|style| style.bg(theme::panel_hover()))
         .focus(|style| style.border_color(theme::focus()))
         .tooltip(text_tooltip(label))
-        .child(panel_icon(icon))
+        .child(
+            svg()
+                .path(icon)
+                .size(px(PANEL_ICON_SIZE))
+                .flex_shrink_0()
+                .text_color(theme::ash())
+                .group_hover(id, |style| style.text_color(theme::bone())),
+        )
 }
 
 #[cfg(test)]
@@ -1703,5 +1729,23 @@ mod reimagined_tests {
             working_stats: None,
         };
         assert_eq!(git_marker(&modified), "M");
+    }
+
+    #[gpui::test]
+    fn collapse_files_stays_hidden_until_a_folder_is_expanded(cx: &mut gpui::TestAppContext) {
+        cx.update(super::super::file_editor::FileEditor::initialize);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let terminal = cx.new(|cx| TerminalView::new("project".into(), cx));
+            FilesPanel::new("project".into(), terminal.downgrade(), window, cx)
+        });
+        cx.simulate_resize(gpui::size(px(300.0), px(500.0)));
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds("collapse-files").is_none());
+        view.update(cx, |panel, cx| {
+            panel.expanded.insert(PathBuf::from("project/src"));
+            cx.notify();
+        });
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds("collapse-files").is_some());
     }
 }
