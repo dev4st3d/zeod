@@ -92,6 +92,10 @@ impl ChecklistView {
         self.data.clone()
     }
 
+    pub(super) fn open_count(&self) -> usize {
+        self.data.open_count()
+    }
+
     pub(super) fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing.is_some() {
             self.input.update(cx, |input, cx| input.focus(window, cx));

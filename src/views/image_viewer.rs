@@ -5,9 +5,10 @@ use std::sync::Arc;
 
 use gpui::{
     Context, EventEmitter, FocusHandle, FontWeight, IntoElement, ObjectFit, Render, Task, Window,
-    div, img, prelude::*, px,
+    div, img, prelude::*, px, svg,
 };
 
+use super::terminal_manager::text_tooltip;
 use crate::services::project_files::{self, FileError, ImageKind, ImageSnapshot};
 use crate::theme;
 use crate::theme::terminal_manager as chrome;
@@ -188,6 +189,12 @@ impl Render for ImageViewer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ready = self.loaded.is_some();
         let fit = self.fit;
+        let relative = self
+            .source
+            .path
+            .strip_prefix(&self.source.project)
+            .unwrap_or(&self.source.path);
+        let status = self.status();
         div()
             .id("image-viewer")
             .key_context("ImageViewer")
@@ -199,6 +206,112 @@ impl Render for ImageViewer {
             .flex()
             .flex_col()
             .bg(theme::canvas())
+            .child(
+                // Slim top header aligned with the diff review bar; keeps the canvas footerless.
+                div()
+                    .id("image-header")
+                    .debug_selector(|| "image-header".into())
+                    .h(px(36.0))
+                    .flex_shrink_0()
+                    .pl(px(12.0))
+                    .pr(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .border_b_1()
+                    .border_color(theme::edge())
+                    .font_family(chrome::CHROME_FONT)
+                    .text_color(theme::bone())
+                    .child(
+                        img(crate::assets::project_icon(&self.source.path, false, false))
+                            .size(px(16.0))
+                            .flex_shrink_0(),
+                    )
+                    .child(
+                        div()
+                            .id("image-file-meta")
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_baseline()
+                            .gap(px(8.0))
+                            .overflow_hidden()
+                            .tooltip(text_tooltip(format!("{} · {status}", relative.display())))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(13.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(self.title()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_family(theme::mono())
+                                    .text_size(px(chrome::DETAIL_TEXT_SIZE))
+                                    .text_color(theme::ash())
+                                    .child(status),
+                            ),
+                    )
+                    .when(ready, |bar| {
+                        bar.child(
+                            div()
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .gap(px(2.0))
+                                .p(px(2.0))
+                                .rounded(px(5.0))
+                                .border_1()
+                                .border_color(theme::edge())
+                                .child(
+                                    mode_button("fit-image", fit)
+                                        .tooltip(text_tooltip("Fit image to pane"))
+                                        .on_click(cx.listener(|viewer, _, _, cx| {
+                                            viewer.fit = true;
+                                            cx.notify();
+                                        }))
+                                        .child("Fit"),
+                                )
+                                .child(
+                                    mode_button("actual-image", !fit)
+                                        .tooltip(text_tooltip("Show image at 100%"))
+                                        .on_click(cx.listener(|viewer, _, _, cx| {
+                                            viewer.fit = false;
+                                            cx.notify();
+                                        }))
+                                        .child("100%"),
+                                ),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("reload-image")
+                            .size(px(26.0))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(chrome::CONTROL_RADIUS))
+                            .border_1()
+                            .border_color(gpui::rgba(0))
+                            .tab_index(0)
+                            .cursor_pointer()
+                            .tooltip(text_tooltip("Reload image"))
+                            .hover(|button| button.bg(theme::panel_hover()))
+                            .focus(|button| button.border_color(theme::focus()))
+                            .on_click(cx.listener(|viewer, _, window, cx| viewer.load(window, cx)))
+                            .child(
+                                svg()
+                                    .path("icons/refresh.svg")
+                                    .size(px(14.0))
+                                    .text_color(theme::ash()),
+                            ),
+                    ),
+            )
             .when(ready, |view| {
                 view.child(
                     div()
@@ -264,47 +377,6 @@ impl Render for ImageViewer {
                         ),
                 )
             })
-            .child(
-                div()
-                    .h(px(chrome::CONTROL_HEIGHT + chrome::SMALL_GAP * 2.0))
-                    .flex_shrink_0()
-                    .px(px(chrome::CONTENT_INSET))
-                    .flex()
-                    .items_center()
-                    .gap(px(chrome::GAP))
-                    .border_t_1()
-                    .border_color(theme::edge_soft())
-                    .bg(theme::floor())
-                    .font_family(theme::mono())
-                    .font_weight(FontWeight::NORMAL)
-                    .text_size(px(chrome::DETAIL_TEXT_SIZE))
-                    .line_height(px(chrome::DETAIL_LINE_HEIGHT))
-                    .text_color(theme::ash())
-                    .child(div().flex_1().min_w_0().truncate().child(self.status()))
-                    .when(ready, |bar| {
-                        bar.child(
-                            mode_button("fit-image", fit)
-                                .on_click(cx.listener(|viewer, _, _, cx| {
-                                    viewer.fit = true;
-                                    cx.notify();
-                                }))
-                                .child("Fit"),
-                        )
-                        .child(
-                            mode_button("actual-image", !fit)
-                                .on_click(cx.listener(|viewer, _, _, cx| {
-                                    viewer.fit = false;
-                                    cx.notify();
-                                }))
-                                .child("100%"),
-                        )
-                    })
-                    .child(
-                        chrome_button("reload-image")
-                            .on_click(cx.listener(|viewer, _, window, cx| viewer.load(window, cx)))
-                            .child("Reload"),
-                    ),
-            )
     }
 }
 
@@ -373,33 +445,23 @@ fn mode_button(id: &'static str, selected: bool) -> gpui::Stateful<gpui::Div> {
         .tab_index(0)
         .cursor_pointer()
         .flex_shrink_0()
-        .h(px(chrome::CONTROL_HEIGHT))
-        .px(px(chrome::INSET))
+        .h(px(20.0))
+        .px(px(8.0))
         .flex()
         .items_center()
-        .rounded(px(chrome::CONTROL_RADIUS))
+        .rounded(px(3.0))
         .border_1()
-        .border_color(if selected {
-            theme::focus()
-        } else {
-            theme::edge_soft()
-        })
-        .bg(if selected {
-            theme::panel()
-        } else {
-            theme::canvas()
-        })
+        .border_color(gpui::rgba(0))
+        .when(selected, |button| button.bg(theme::panel_hover()))
         .font_family(chrome::CHROME_FONT)
-        .font_weight(FontWeight::MEDIUM)
-        .text_size(px(chrome::CONTROL_TEXT_SIZE))
-        .line_height(px(chrome::CONTROL_LINE_HEIGHT))
+        .text_size(px(chrome::DETAIL_TEXT_SIZE))
         .text_color(if selected {
             theme::bone()
         } else {
             theme::ash()
         })
         .hover(|button| button.bg(theme::panel_hover()).text_color(theme::bone()))
-        .focus(|button| button.bg(theme::panel_hover()).text_color(theme::focus()))
+        .focus(|button| button.border_color(theme::focus()))
 }
 
 #[cfg(test)]

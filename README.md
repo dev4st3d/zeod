@@ -57,7 +57,7 @@ Settings can replace the main shortcuts. Explorer, diff, and checklist keys stay
 
 ## Themes
 
-Black, Light, Graphite, Charcoal, Flint, Stone, Slate, Moss, Kiln, and Iris. Pick one beside **New terminal**, and open files, diffs, and terminals update immediately.
+Black, Light, Graphite, Charcoal, Flint, Stone, Slate, Moss, Kiln, and Iris. Pick one in Settings (`Ctrl+,`), and open files, diffs, and terminals update immediately.
 
 ## Build from source
 

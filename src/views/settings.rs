@@ -29,6 +29,7 @@ const ROW_BUTTON_WIDTH: f32 = 60.0;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum SettingsEvent {
+    AppearanceChanged(theme::Appearance),
     FontChanged(TerminalFont),
     ShortcutChanged(Shortcut, Keystroke),
     ShortcutReset(Shortcut),
@@ -39,6 +40,7 @@ pub(crate) enum SettingsEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsTab {
     Terminal,
+    Appearance,
     Keyboard,
 }
 
@@ -46,6 +48,7 @@ pub(crate) struct SettingsPanel {
     tab: SettingsTab,
     families: Vec<SharedString>,
     family_cursor: usize,
+    appearance_cursor: usize,
     shortcut_cursor: usize,
     recording: Option<Shortcut>,
     rejection: Option<String>,
@@ -53,8 +56,10 @@ pub(crate) struct SettingsPanel {
     first_stop: FocusHandle,
     last_stop: FocusHandle,
     family_focus: FocusHandle,
+    appearance_focus: FocusHandle,
     shortcut_focus: FocusHandle,
     family_scroll: ScrollHandle,
+    appearance_scroll: ScrollHandle,
     shortcut_scroll: ScrollHandle,
     _recorder: Option<Subscription>,
     _observers: [Subscription; 2],
@@ -73,10 +78,15 @@ impl SettingsPanel {
             .iter()
             .position(|family| *family == current)
             .unwrap_or(0);
+        let appearance_cursor = theme::Appearance::ALL
+            .iter()
+            .position(|appearance| *appearance == theme::appearance())
+            .unwrap_or(0);
         Self {
             tab: SettingsTab::Terminal,
             families,
             family_cursor,
+            appearance_cursor,
             shortcut_cursor: 0,
             recording: None,
             rejection: None,
@@ -84,8 +94,10 @@ impl SettingsPanel {
             first_stop: cx.focus_handle(),
             last_stop: cx.focus_handle(),
             family_focus: cx.focus_handle(),
+            appearance_focus: cx.focus_handle(),
             shortcut_focus: cx.focus_handle(),
             family_scroll: ScrollHandle::new(),
+            appearance_scroll: ScrollHandle::new(),
             shortcut_scroll: ScrollHandle::new(),
             _recorder: None,
             _observers: [
@@ -151,6 +163,47 @@ impl SettingsPanel {
             .unwrap_or(0);
         self.family_scroll.scroll_to_item(self.family_cursor);
         cx.emit(SettingsEvent::FontChanged(font));
+        cx.notify();
+    }
+
+    fn choose_appearance(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(&appearance) = theme::Appearance::ALL.get(index) else {
+            return;
+        };
+        self.appearance_cursor = index;
+        if theme::appearance() != appearance {
+            cx.emit(SettingsEvent::AppearanceChanged(appearance));
+        }
+        cx.notify();
+    }
+
+    fn reset_appearance(&mut self, cx: &mut Context<Self>) {
+        let default = theme::Appearance::default();
+        self.appearance_cursor = theme::Appearance::ALL
+            .iter()
+            .position(|appearance| *appearance == default)
+            .unwrap_or(0);
+        self.appearance_scroll
+            .scroll_to_item(self.appearance_cursor);
+        if theme::appearance() != default {
+            cx.emit(SettingsEvent::AppearanceChanged(default));
+        }
+        cx.notify();
+    }
+
+    fn on_appearance_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let last = theme::Appearance::ALL.len() - 1;
+        match event.keystroke.key.as_str() {
+            "up" => self.appearance_cursor = self.appearance_cursor.saturating_sub(1),
+            "down" => self.appearance_cursor = (self.appearance_cursor + 1).min(last),
+            "home" => self.appearance_cursor = 0,
+            "end" => self.appearance_cursor = last,
+            "enter" | "space" => self.choose_appearance(self.appearance_cursor, cx),
+            _ => return,
+        }
+        self.appearance_scroll
+            .scroll_to_item(self.appearance_cursor);
+        cx.stop_propagation();
         cx.notify();
     }
 
@@ -373,6 +426,11 @@ impl SettingsPanel {
                 tab("settings-tab-terminal", "Terminal", SettingsTab::Terminal)
                     .track_focus(&self.first_stop),
             )
+            .child(tab(
+                "settings-tab-appearance",
+                "Appearance",
+                SettingsTab::Appearance,
+            ))
             .child(tab(
                 "settings-tab-keyboard",
                 "Keyboard",
@@ -730,18 +788,149 @@ impl SettingsPanel {
             )
     }
 
+    fn appearance_tab(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let list_focused = self.appearance_focus.is_focused(window);
+        let active = theme::appearance();
+        div()
+            .id("settings-appearance")
+            .flex_1()
+            .min_h_0()
+            .px(px(chrome::CONTENT_INSET))
+            .py(px(chrome::INSET))
+            .flex()
+            .gap(px(chrome::CONTENT_INSET))
+            .child(
+                div()
+                    .w(px(chrome::FONT_LIST_WIDTH))
+                    .flex_shrink_0()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(chrome::SMALL_GAP))
+                    .child(section_label("Theme"))
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h(px(chrome::FONT_ROW_HEIGHT * 4.0))
+                            .child(
+                                div()
+                                    .id("settings-themes")
+                                    .track_focus(&self.appearance_focus)
+                                    .tab_index(0)
+                                    .absolute()
+                                    .inset_0()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.appearance_scroll)
+                                    .border_1()
+                                    .border_color(theme::edge())
+                                    .rounded(px(chrome::CONTROL_RADIUS))
+                                    .focus(|style| style.border_color(theme::focus()))
+                                    .on_key_down(cx.listener(
+                                        |view, event: &KeyDownEvent, _, cx| {
+                                            view.on_appearance_key(event, cx)
+                                        },
+                                    ))
+                                    .children(theme::Appearance::ALL.into_iter().enumerate().map(
+                                        |(index, appearance)| {
+                                            let current = appearance == active;
+                                            let cursor = self.appearance_cursor == index;
+                                            div()
+                                                .id(("settings-theme", index))
+                                                .debug_selector(move || {
+                                                    format!("settings-theme-{index}")
+                                                })
+                                                .relative()
+                                                .h(px(chrome::FONT_ROW_HEIGHT))
+                                                .pl(px(chrome::COMPACT_GAP))
+                                                .pr(px(chrome::SCROLLBAR_GUTTER))
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(chrome::COMPACT_GAP))
+                                                .cursor_pointer()
+                                                .when(cursor, |row| row.bg(theme::selection()))
+                                                .hover(|style| style.bg(theme::panel_hover()))
+                                                .on_click(cx.listener(
+                                                    move |view, _, window, cx| {
+                                                        window.focus(&view.appearance_focus);
+                                                        view.choose_appearance(index, cx)
+                                                    },
+                                                ))
+                                                .when(cursor && list_focused, |row| {
+                                                    row.child(focus_bar())
+                                                })
+                                                .child(
+                                                    div()
+                                                        .size(px(12.0))
+                                                        .flex_shrink_0()
+                                                        .rounded_full()
+                                                        .bg(appearance.swatch())
+                                                        .border_1()
+                                                        .border_color(appearance.swatch_accent()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .child(appearance.label()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w(px(chrome::ICON_SIZE))
+                                                        .flex_shrink_0()
+                                                        .text_color(theme::focus())
+                                                        .when(current, |mark| {
+                                                            mark.child(check_mark())
+                                                        }),
+                                                )
+                                        },
+                                    )),
+                            )
+                            .child(scroll_indicator(&self.appearance_scroll)),
+                    )
+                    .child(hint(format!(
+                        "{} themes · ↑ ↓ then Enter to choose",
+                        theme::Appearance::ALL.len()
+                    ))),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(chrome::SMALL_GAP))
+                    .child(section_label("Preview"))
+                    .child(appearance_preview(active)),
+            )
+    }
+
     fn footer(
         &self,
         font: &TerminalFont,
         keymap: &Keymap,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let keyboard = self.tab == SettingsTab::Keyboard;
-        let resettable = if keyboard {
-            keymap.has_customizations()
-        } else {
-            !font.is_default()
+        let (reset_label, resettable, hint_text) = match self.tab {
+            SettingsTab::Terminal => (
+                "Reset font",
+                !font.is_default(),
+                "Changes apply to every terminal immediately.",
+            ),
+            SettingsTab::Appearance => (
+                "Reset theme",
+                theme::appearance() != theme::Appearance::default(),
+                "Changes apply to files, diffs, and terminals immediately.",
+            ),
+            SettingsTab::Keyboard => (
+                "Reset all shortcuts",
+                keymap.has_customizations(),
+                "↑ ↓ select · Enter change · Delete reset",
+            ),
         };
+        let tab = self.tab;
         div()
             .h(px(chrome::TOOLBAR_HEIGHT))
             .flex_shrink_0()
@@ -752,22 +941,11 @@ impl SettingsPanel {
             .border_t_1()
             .border_color(theme::edge())
             .child(
-                button(
-                    "settings-reset",
-                    if keyboard {
-                        "Reset all shortcuts"
-                    } else {
-                        "Reset font"
-                    },
-                    resettable,
-                )
-                .when(resettable, |reset| {
-                    reset.on_click(cx.listener(move |view, _, _, cx| {
-                        if keyboard {
-                            view.reset_all_shortcuts(cx)
-                        } else {
-                            view.reset_font(cx)
-                        }
+                button("settings-reset", reset_label, resettable).when(resettable, |reset| {
+                    reset.on_click(cx.listener(move |view, _, _, cx| match tab {
+                        SettingsTab::Terminal => view.reset_font(cx),
+                        SettingsTab::Appearance => view.reset_appearance(cx),
+                        SettingsTab::Keyboard => view.reset_all_shortcuts(cx),
                     }))
                 }),
             )
@@ -778,11 +956,7 @@ impl SettingsPanel {
                     .truncate()
                     .text_size(px(chrome::DETAIL_TEXT_SIZE))
                     .text_color(theme::ash())
-                    .child(if keyboard {
-                        "↑ ↓ select · Enter change · Delete reset"
-                    } else {
-                        "Changes apply to every terminal immediately."
-                    }),
+                    .child(hint_text),
             )
             .child(
                 done_button()
@@ -850,6 +1024,9 @@ impl Render for SettingsPanel {
                     .child(match self.tab {
                         SettingsTab::Terminal => {
                             self.terminal_tab(&font, window, cx).into_any_element()
+                        }
+                        SettingsTab::Appearance => {
+                            self.appearance_tab(window, cx).into_any_element()
                         }
                         SettingsTab::Keyboard => {
                             self.keyboard_tab(&keymap, window, cx).into_any_element()
@@ -1127,6 +1304,159 @@ fn preview(font: &TerminalFont) -> impl IntoElement {
         .child("The quick brown fox jumps over the lazy dog")
 }
 
+/// Live miniature of the workbench chrome, explorer, and diff tones in the active theme.
+fn appearance_preview(active: theme::Appearance) -> impl IntoElement {
+    div()
+        .id("settings-appearance-preview")
+        .flex_1()
+        .min_h(px(140.0))
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .rounded(px(chrome::CONTROL_RADIUS))
+        .border_1()
+        .border_color(theme::edge())
+        .bg(theme::canvas())
+        .child(
+            div()
+                .h(px(30.0))
+                .px(px(10.0))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .bg(theme::chrome())
+                .border_b_1()
+                .border_color(theme::edge())
+                .child(
+                    div()
+                        .font_family(chrome::HEADING_FONT)
+                        .text_size(px(16.0))
+                        .text_color(theme::focus())
+                        .child("Zeod."),
+                )
+                .child(
+                    div()
+                        .h_full()
+                        .px(px(6.0))
+                        .flex()
+                        .items_center()
+                        .border_b_2()
+                        .border_color(theme::focus())
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::bone())
+                        .child("workspace"),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme::ash())
+                        .child("api"),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .font_family(theme::mono())
+                        .text_size(px(10.0))
+                        .text_color(theme::ash())
+                        .child(active.label()),
+                ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .child(
+                    div()
+                        .w(px(116.0))
+                        .flex_shrink_0()
+                        .p(px(8.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .bg(theme::floor())
+                        .border_r_1()
+                        .border_color(theme::edge())
+                        .text_size(px(11.0))
+                        .line_height(px(16.0))
+                        .child(
+                            div()
+                                .px(px(6.0))
+                                .py(px(2.0))
+                                .rounded(px(3.0))
+                                .bg(theme::selection())
+                                .text_color(theme::bone())
+                                .child("main.rs"),
+                        )
+                        .child(
+                            div()
+                                .px(px(6.0))
+                                .text_color(theme::git_modified())
+                                .child("theme.rs"),
+                        )
+                        .child(
+                            div()
+                                .px(px(6.0))
+                                .text_color(theme::git_added())
+                                .child("grid.rs"),
+                        )
+                        .child(
+                            div()
+                                .px(px(6.0))
+                                .text_color(theme::git_ignored())
+                                .child("target"),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .p(px(10.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .font_family(theme::mono())
+                        .text_size(px(11.0))
+                        .line_height(px(18.0))
+                        .child(
+                            div()
+                                .px(px(6.0))
+                                .text_color(theme::ash())
+                                .child("// quiet chrome, live diff"),
+                        )
+                        .child(
+                            div()
+                                .px(px(6.0))
+                                .rounded(px(2.0))
+                                .bg(theme::diff_removed())
+                                .text_color(theme::bone())
+                                .child("− let height = 134.0;"),
+                        )
+                        .child(
+                            div()
+                                .px(px(6.0))
+                                .rounded(px(2.0))
+                                .bg(theme::diff_added())
+                                .text_color(theme::bone())
+                                .child("+ let height = 82.0;"),
+                        )
+                        .child(
+                            div()
+                                .mt(px(4.0))
+                                .px(px(6.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(div().text_color(theme::focus()).child("$"))
+                                .child(div().text_color(theme::bone()).child("cargo test"))
+                                .child(div().text_color(theme::success()).child("ok")),
+                        ),
+                ),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1301,5 +1631,34 @@ mod tests {
             "Ctrl+Shift+T or Ctrl+`"
         );
         assert_eq!(default_hint(Shortcut::FocusProjects), "F6");
+    }
+
+    #[gpui::test]
+    fn appearance_tab_reports_theme_changes_and_resets_to_default(cx: &mut TestAppContext) {
+        let original = theme::appearance();
+        theme::set_appearance(theme::Appearance::Stone);
+        let (panel, events, cx) = open(cx);
+        panel.update(cx, |panel, cx| {
+            panel.select_tab(SettingsTab::Appearance, cx);
+        });
+        cx.update(|window, cx| {
+            let handle = panel.read(cx).appearance_focus.clone();
+            window.focus(&handle);
+        });
+        cx.simulate_keystrokes("home enter");
+        assert_eq!(
+            events.borrow().as_slice(),
+            [SettingsEvent::AppearanceChanged(theme::Appearance::Black)]
+        );
+        theme::set_appearance(theme::Appearance::Black);
+        events.borrow_mut().clear();
+        panel.update(cx, |panel, cx| panel.reset_appearance(cx));
+        assert_eq!(
+            events.borrow().as_slice(),
+            [SettingsEvent::AppearanceChanged(
+                theme::Appearance::default()
+            )]
+        );
+        theme::set_appearance(original);
     }
 }

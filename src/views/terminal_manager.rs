@@ -23,7 +23,7 @@ use crate::services::{
     app_update::{self, CheckOutcome, PrepareOutcome, ScheduleOutcome},
     keymap::{self, Keymap, Shortcut, ShortcutGroup},
     terminal_font::{self, TerminalFont},
-    terminal_workspace::{MAX_TERMINAL_TABS, TerminalWorkspace},
+    terminal_workspace::TerminalWorkspace,
 };
 use crate::theme;
 use crate::theme::terminal_manager as chrome;
@@ -131,11 +131,6 @@ pub(crate) struct TerminalManager {
     selector_bounds: Option<Bounds<Pixels>>,
     selector_scroll: ScrollHandle,
     selector_selected: usize,
-    appearance_menu_open: bool,
-    appearance_focus: FocusHandle,
-    appearance_trigger_focus: FocusHandle,
-    appearance_bounds: Option<Bounds<Pixels>>,
-    appearance_selected: usize,
     appearance_revision: u64,
     appearance_saving: bool,
     settings: Option<Entity<SettingsPanel>>,
@@ -248,11 +243,6 @@ impl TerminalManager {
             selector_bounds: None,
             selector_scroll: ScrollHandle::new(),
             selector_selected: 0,
-            appearance_menu_open: false,
-            appearance_focus: cx.focus_handle(),
-            appearance_trigger_focus: cx.focus_handle(),
-            appearance_bounds: None,
-            appearance_selected: 0,
             appearance_revision: 0,
             appearance_saving: false,
             settings: None,
@@ -408,7 +398,6 @@ impl TerminalManager {
         self.update_scheduling = true;
         self.update_state = UpdateState::Scheduling;
         self.selector_open = false;
-        self.appearance_menu_open = false;
         window.focus(&self.focus_handle);
         cx.notify();
         let schedule_version = version.clone();
@@ -490,7 +479,7 @@ impl TerminalManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.interaction_locked() {
+        if self.update_scheduling {
             return;
         }
         theme::set_appearance(appearance);
@@ -502,10 +491,12 @@ impl TerminalManager {
             project.files.update(cx, |_, cx| cx.notify());
             project.git.update(cx, |_, cx| cx.notify());
         }
-        self.appearance_menu_open = false;
         self.appearance_revision = self.appearance_revision.wrapping_add(1);
         self.save_appearance(window, cx);
-        self.focus_active(window, cx);
+        // Keep keyboard focus inside Settings while the dialog owns input.
+        if self.settings.is_none() {
+            self.focus_active(window, cx);
+        }
         cx.notify();
     }
 
@@ -685,7 +676,6 @@ impl TerminalManager {
             return;
         }
         self.selector_open = false;
-        self.appearance_menu_open = false;
         let panel = cx.new(SettingsPanel::new);
         self._settings_subscription = Some(cx.subscribe_in(
             &panel,
@@ -715,6 +705,9 @@ impl TerminalManager {
     ) {
         let mut keymap = Keymap::global(cx).clone();
         match event {
+            SettingsEvent::AppearanceChanged(appearance) => {
+                return self.choose_appearance(*appearance, window, cx);
+            }
             SettingsEvent::FontChanged(font) => return self.set_font(font.clone(), window, cx),
             SettingsEvent::Closed => return self.close_settings(window, cx),
             SettingsEvent::ShortcutChanged(shortcut, keystroke) => {
@@ -727,109 +720,6 @@ impl TerminalManager {
             SettingsEvent::AllShortcutsReset => keymap.reset_all(),
         }
         self.set_keymap(keymap, window, cx);
-    }
-
-    fn appearance_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("appearance-menu")
-            .track_focus(&self.appearance_focus)
-            .debug_selector(|| "appearance-menu".into())
-            .occlude()
-            .w(px(chrome::MENU_WIDTH))
-            .max_h(px(chrome::MENU_MAX_HEIGHT))
-            .overflow_y_scroll()
-            .p(px(chrome::SMALL_GAP))
-            .font_family(chrome::CHROME_FONT)
-            .font_weight(FontWeight::NORMAL)
-            .text_size(px(chrome::CONTROL_TEXT_SIZE))
-            .line_height(px(chrome::CONTROL_LINE_HEIGHT))
-            .text_color(theme::bone())
-            .bg(theme::panel_lift())
-            .border_1()
-            .border_color(theme::edge_hard())
-            .rounded(px(chrome::CONTROL_RADIUS))
-            .on_mouse_down_out(
-                cx.listener(|view, event: &gpui::MouseDownEvent, window, cx| {
-                    if view
-                        .appearance_bounds
-                        .is_some_and(|bounds| bounds.contains(&event.position))
-                    {
-                        return;
-                    }
-                    view.appearance_menu_open = false;
-                    if view.appearance_focus.is_focused(window) {
-                        view.focus_active(window, cx);
-                    }
-                    cx.notify();
-                }),
-            )
-            .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
-                let count = theme::Appearance::ALL.len();
-                match event.keystroke.key.as_str() {
-                    "up" => {
-                        view.appearance_selected = (view.appearance_selected + count - 1) % count
-                    }
-                    "down" => view.appearance_selected = (view.appearance_selected + 1) % count,
-                    "tab" if !event.keystroke.modifiers.shift => {
-                        view.appearance_selected = (view.appearance_selected + 1) % count
-                    }
-                    "enter" | "space" => view.choose_appearance(
-                        theme::Appearance::ALL[view.appearance_selected],
-                        window,
-                        cx,
-                    ),
-                    "escape" => {
-                        view.appearance_menu_open = false;
-                        window.focus(&view.appearance_trigger_focus);
-                    }
-                    _ => return,
-                }
-                cx.stop_propagation();
-                cx.notify();
-            }))
-            .children(
-                theme::Appearance::ALL
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, appearance)| {
-                        div()
-                            .id(("appearance-choice", index))
-                            .h(px(chrome::MENU_ROW_HEIGHT))
-                            .px(px(chrome::COMPACT_GAP))
-                            .flex()
-                            .items_center()
-                            .gap(px(chrome::SMALL_GAP))
-                            .justify_between()
-                            .rounded(px(chrome::CONTROL_RADIUS))
-                            .border_1()
-                            .border_color(if index == self.appearance_selected {
-                                theme::focus()
-                            } else {
-                                gpui::rgba(0)
-                            })
-                            .when(index == self.appearance_selected, |row| {
-                                row.bg(theme::selection())
-                            })
-                            .cursor_pointer()
-                            .hover(|row| row.bg(theme::panel_hover()))
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                view.choose_appearance(appearance, window, cx)
-                            }))
-                            .child(
-                                div()
-                                    .size(px(10.0))
-                                    .flex_shrink_0()
-                                    .rounded_full()
-                                    .bg(appearance.swatch())
-                                    .border_1()
-                                    .border_color(appearance.swatch_accent()),
-                            )
-                            .child(div().flex_1().min_w_0().child(appearance.label()))
-                            .when(appearance == theme::appearance(), |row| {
-                                row.child(check_mark())
-                            })
-                    }),
-            )
     }
 
     fn push_terminal(
@@ -1326,42 +1216,69 @@ impl TerminalManager {
 
     fn checklist_toggle(&self, enabled: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.workspace.as_ref().is_some_and(|w| w.inspector_visible);
+        let open_tasks = self
+            .active_project()
+            .map_or(0, |project| project.checklist.read(cx).open_count());
+        let action = if selected { "Hide" } else { "Show" };
+        let shortcut = Keymap::global(cx).hint(Shortcut::ToggleChecklist);
+        let tooltip = if open_tasks > 0 {
+            format!("{action} reminders ({open_tasks} open) · {shortcut}")
+        } else {
+            format!("{action} reminders · {shortcut}")
+        };
         div()
             .id("toggle-checklist")
             .debug_selector(|| "toggle-checklist".into())
-            .size(px(chrome::MAIN_CONTROL_HEIGHT))
+            .h_full()
+            .min_w(px(chrome::WINDOW_CONTROL_WIDTH))
+            .px(px(chrome::INSET))
             .flex_shrink_0()
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(chrome::CONTROL_RADIUS))
-            .border_1()
-            .border_color(gpui::transparent_black())
-            .bg(theme::panel())
-            .when(selected, |b| b.bg(theme::panel_hover()))
-            .tooltip(text_tooltip(format!(
-                "{} project checklist · {}",
-                if selected { "Hide" } else { "Show" },
-                Keymap::global(cx).hint(Shortcut::ToggleChecklist)
-            )))
+            .gap(px(5.0))
+            .border_b_2()
+            .border_color(if selected {
+                theme::focus()
+            } else {
+                gpui::rgba(0)
+            })
+            .tooltip(text_tooltip(tooltip))
             .when(enabled, |b| {
                 b.tab_index(0)
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme::panel_hover()))
-                    .focus(|s| s.border_color(theme::focus()))
+                    .hover(|s| s.bg(theme::panel_lift()))
+                    .active(|s| s.bg(theme::selection()))
+                    .focus(|s| s.bg(theme::selection()))
                     .on_click(cx.listener(|view, _, window, cx| view.toggle_checklist(window, cx)))
             })
             .when(!enabled, |b| b.opacity(0.5))
             .child(
                 svg()
-                    .path("icons/inspector.svg")
-                    .size(px(16.0))
+                    .path("icons/checklist.svg")
+                    .size(px(chrome::ICON_SIZE))
+                    .flex_shrink_0()
                     .text_color(if selected {
                         theme::bone()
                     } else {
                         theme::ash()
                     }),
             )
+            .when(open_tasks > 0, |b| {
+                b.child(
+                    div()
+                        .flex_shrink_0()
+                        .font_family(theme::mono())
+                        .text_size(px(chrome::DETAIL_TEXT_SIZE))
+                        .line_height(px(chrome::DETAIL_LINE_HEIGHT))
+                        .text_color(if selected {
+                            theme::focus()
+                        } else {
+                            theme::ash()
+                        })
+                        .child(open_tasks.to_string()),
+                )
+            })
     }
 
     fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1504,12 +1421,235 @@ impl TerminalManager {
         cx.notify();
     }
 
-    fn titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let project = self
+    /// Quiet live signals for a project: Git branch, dirty change count (when non-zero),
+    /// and counts of `(exited, failed)` terminals.
+    fn project_signals(
+        &self,
+        index: usize,
+        cx: &gpui::App,
+    ) -> (Option<String>, Option<usize>, (usize, usize)) {
+        let Some(project) = self.projects.get(index) else {
+            return (None, None, (0, 0));
+        };
+        let git = project.git.read(cx);
+        let branch = git.branch().map(ToOwned::to_owned);
+        let changes = git.change_count().filter(|&count| count > 0);
+        let stopped = project.terminal.read(cx).stopped_terminal_counts(cx);
+        (branch, changes, stopped)
+    }
+
+    fn project_strip(&self, available: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let entries = self
             .workspace
             .as_ref()
-            .map(|workspace| project_name(&workspace.projects[workspace.active].path));
-        let title = project.unwrap_or_default();
+            .map(|workspace| (workspace.projects.clone(), workspace.active));
+        let count = entries.as_ref().map_or(0, |(projects, _)| projects.len());
+        let can_remove = available && !self.picker_pending && count > 1;
+        let tabs = entries
+            .into_iter()
+            .flat_map(|(projects, active)| {
+                projects
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(index, project)| (index, project, index == active))
+            })
+            .map(|(index, project, active)| {
+                let name = project_name(&project.path);
+                let (branch, changes, (exited, failed)) = self.project_signals(index, cx);
+                let mut tooltip = project.path.to_string_lossy().into_owned();
+                if let Some(branch) = &branch {
+                    tooltip.push_str(&format!("\nBranch {branch}"));
+                }
+                if let Some(changes) = changes {
+                    tooltip.push_str(&format!(
+                        " · {changes} change{}",
+                        if changes == 1 { "" } else { "s" }
+                    ));
+                }
+                if failed > 0 {
+                    tooltip.push_str(&format!(
+                        "\n{failed} terminal{} failed",
+                        if failed == 1 { "" } else { "s" }
+                    ));
+                } else if exited > 0 {
+                    tooltip.push_str(&format!(
+                        "\n{exited} terminal{} exited",
+                        if exited == 1 { "" } else { "s" }
+                    ));
+                }
+                let menu_owner = cx.weak_entity();
+                let menu_path = project.path.clone();
+                let tab = div()
+                    .id(("project-tab", index))
+                    .debug_selector(move || format!("project-tab-{index}"))
+                    .h_full()
+                    .max_w(px(chrome::PROJECT_TAB_MAX_WIDTH))
+                    .px(px(10.0))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(chrome::SMALL_GAP))
+                    .border_b_2()
+                    .border_color(if active {
+                        theme::focus()
+                    } else {
+                        gpui::rgba(0)
+                    })
+                    .font_family(chrome::CHROME_FONT)
+                    .text_size(px(chrome::TITLEBAR_TEXT_SIZE))
+                    .line_height(px(chrome::CHROME_LINE_HEIGHT))
+                    .font_weight(if active {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(if active { theme::bone() } else { theme::ash() })
+                    .tooltip(text_tooltip(tooltip))
+                    .when(!available, |tab| tab.opacity(0.55))
+                    .when(available, |tab| {
+                        tab.tab_index(0)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::panel_hover()).text_color(theme::bone()))
+                            .active(|style| style.bg(theme::selection()))
+                            .focus(|style| style.bg(theme::selection()).text_color(theme::bone()))
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.select_project(index, window, cx)
+                            }))
+                    })
+                    .child(div().min_w_0().truncate().child(name))
+                    .when_some(changes, |tab, changes| {
+                        tab.child(
+                            div()
+                                .flex_shrink_0()
+                                .font_family(theme::mono())
+                                .font_weight(FontWeight::NORMAL)
+                                .text_size(px(chrome::DETAIL_TEXT_SIZE))
+                                .text_color(if active { theme::focus() } else { theme::ash() })
+                                .child(changes.to_string()),
+                        )
+                    })
+                    .when(failed > 0 || exited > 0, |tab| {
+                        tab.child(stopped_shell_mark(failed > 0))
+                    });
+                div()
+                    .id(("project-tab-wrap", index))
+                    .h_full()
+                    .flex_shrink_0()
+                    .child(tab.context_menu(move |menu, _, _| {
+                        project_menu(
+                            menu,
+                            menu_owner.clone(),
+                            index,
+                            menu_path.clone(),
+                            can_remove,
+                        )
+                    }))
+            })
+            .collect::<Vec<_>>();
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .id("project-tabs")
+                    .flex_initial()
+                    .min_w_0()
+                    .h_full()
+                    .overflow_x_scroll()
+                    .flex()
+                    .items_center()
+                    .children(tabs),
+            )
+            .child(
+                div()
+                    .relative()
+                    .ml(px(4.0))
+                    .flex_shrink_0()
+                    .on_children_prepainted(cx.processor(
+                        |view, bounds: Vec<Bounds<Pixels>>, _, _| {
+                            view.selector_bounds = bounds.first().copied();
+                        },
+                    ))
+                    .child(
+                        div()
+                            .id("project-selector")
+                            .debug_selector(|| "project-selector".into())
+                            .track_focus(&self.selector_trigger_focus)
+                            .size(px(chrome::TAB_LIST_BUTTON))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(chrome::CONTROL_RADIUS))
+                            .border_1()
+                            .border_color(if self.selector_open {
+                                theme::edge_hard()
+                            } else {
+                                gpui::rgba(0)
+                            })
+                            .bg(if self.selector_open {
+                                theme::selection()
+                            } else {
+                                gpui::rgba(0)
+                            })
+                            .tooltip(text_tooltip(format!(
+                                "Switch or add project · {}",
+                                Keymap::global(cx).hint(Shortcut::AddProject)
+                            )))
+                            .when(!available, |button| button.opacity(0.55))
+                            .when(available, |button| {
+                                button
+                                    .tab_index(0)
+                                    .cursor_pointer()
+                                    .hover(move |style| {
+                                        style.bg(if self.selector_open {
+                                            theme::selection()
+                                        } else {
+                                            theme::panel_hover()
+                                        })
+                                    })
+                                    .active(|style| style.bg(theme::selection()))
+                                    .focus(|style| style.border_color(theme::focus()))
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.selector_open = !view.selector_open;
+                                        view.selector_selected = view
+                                            .workspace
+                                            .as_ref()
+                                            .map_or(0, |workspace| workspace.active);
+                                        if view.selector_open {
+                                            view.selector_scroll
+                                                .scroll_to_item(view.selector_selected);
+                                            window.focus(&view.selector_focus);
+                                        } else {
+                                            window.focus(&view.selector_trigger_focus);
+                                        }
+                                        cx.notify();
+                                    }))
+                            })
+                            .child(picker_chevron(self.selector_open)),
+                    )
+                    .when(self.selector_open, |wrapper| {
+                        wrapper.child(picker_popup(self.project_selector(cx)))
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(48.0))
+                    .h_full()
+                    .window_control_area(WindowControlArea::Drag),
+            )
+    }
+
+    fn titlebar(
+        &self,
+        sidebar_visible: bool,
+        available: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .h(px(chrome::TITLEBAR_HEIGHT))
             .w_full()
@@ -1523,7 +1663,8 @@ impl TerminalManager {
                 div()
                     .flex_shrink_0()
                     .h_full()
-                    .px(px(chrome::TITLEBAR_INSET))
+                    .pl(px(chrome::TITLEBAR_INSET))
+                    .pr(px(chrome::INSET))
                     .flex()
                     .items_center()
                     .whitespace_nowrap()
@@ -1534,20 +1675,29 @@ impl TerminalManager {
                     .text_color(theme::focus())
                     .child("Zeod."),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .px(px(chrome::TITLEBAR_INSET))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .window_control_area(WindowControlArea::Drag)
-                    .text_size(px(chrome::TITLEBAR_TEXT_SIZE))
-                    .text_color(theme::ash())
-                    .child(div().truncate().child(title)),
-            )
+            .when(!sidebar_visible && !self.update_scheduling, |bar| {
+                bar.child(sidebar_toggle(available, cx))
+            })
+            .when(!self.update_scheduling, |bar| {
+                bar.child(
+                    div()
+                        .w(px(1.0))
+                        .h(px(16.0))
+                        .mr(px(4.0))
+                        .flex_shrink_0()
+                        .bg(theme::edge()),
+                )
+                .child(self.project_strip(available, cx))
+                .child(self.checklist_toggle(available, cx))
+            })
+            .when(self.update_scheduling, |bar| {
+                bar.child(
+                    div()
+                        .flex_1()
+                        .h_full()
+                        .window_control_area(WindowControlArea::Drag),
+                )
+            })
             .child(
                 window_control(
                     "open-settings",
@@ -1599,274 +1749,6 @@ impl TerminalManager {
                         window.remove_window();
                     }
                 })),
-            )
-    }
-
-    fn project_picker(
-        &self,
-        title: String,
-        path: String,
-        available: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .relative()
-            .min_w(px(100.0))
-            .w_full()
-            .h(px(chrome::MAIN_CONTROL_HEIGHT))
-            .on_children_prepainted(cx.processor(|view, bounds: Vec<Bounds<Pixels>>, _, _| {
-                view.selector_bounds = bounds.first().copied();
-            }))
-            .child(
-                picker_trigger("project-selector", self.selector_open)
-                    .text_size(px(14.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .w_full()
-                    .debug_selector(|| "project-selector".into())
-                    .track_focus(&self.selector_trigger_focus)
-                    .tooltip(text_tooltip(path))
-                    .when(!available, |button| button.opacity(0.55))
-                    .when(available, |button| {
-                        button.tab_index(0).cursor_pointer().on_click(cx.listener(
-                            |view, _, window, cx| {
-                                view.appearance_menu_open = false;
-                                view.selector_open = !view.selector_open;
-                                view.selector_selected = view
-                                    .workspace
-                                    .as_ref()
-                                    .map_or(0, |workspace| workspace.active);
-                                if view.selector_open {
-                                    view.selector_scroll.scroll_to_item(view.selector_selected);
-                                    window.focus(&view.selector_focus);
-                                } else {
-                                    window.focus(&view.selector_trigger_focus);
-                                }
-                                cx.notify();
-                            },
-                        ))
-                    })
-                    .child(
-                        svg()
-                            .path("icons/folder.svg")
-                            .size(px(chrome::ICON_SIZE))
-                            .flex_shrink_0()
-                            .text_color(theme::ash()),
-                    )
-                    .child(
-                        div()
-                            .id("project-selector-label")
-                            .debug_selector(|| "project-selector-label".into())
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .child(SharedString::from(title)),
-                    )
-                    .child(picker_chevron(self.selector_open)),
-            )
-            .when(self.selector_open, |wrapper| {
-                wrapper.child(picker_popup(self.project_selector(cx)))
-            })
-    }
-
-    fn appearance_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .relative()
-            .w(px(chrome::APPEARANCE_CONTROL_WIDTH))
-            .h(px(chrome::MAIN_CONTROL_HEIGHT))
-            .flex_shrink_0()
-            .on_children_prepainted(cx.processor(|view, bounds: Vec<Bounds<Pixels>>, _, _| {
-                view.appearance_bounds = bounds.first().copied();
-            }))
-            .child(
-                picker_trigger("appearance-picker", self.appearance_menu_open)
-                    .text_size(px(12.0))
-                    .font_weight(FontWeight::NORMAL)
-                    .debug_selector(|| "appearance-picker".into())
-                    .track_focus(&self.appearance_trigger_focus)
-                    .w_full()
-                    .tab_index(0)
-                    .cursor_pointer()
-                    .tooltip(text_tooltip("Choose appearance"))
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.selector_open = false;
-                        view.appearance_menu_open = !view.appearance_menu_open;
-                        if view.appearance_menu_open {
-                            view.appearance_selected = theme::Appearance::ALL
-                                .iter()
-                                .position(|appearance| *appearance == theme::appearance())
-                                .unwrap_or(0);
-                            window.focus(&view.appearance_focus);
-                        } else {
-                            window.focus(&view.appearance_trigger_focus);
-                        }
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .size(px(10.0))
-                            .flex_shrink_0()
-                            .rounded_full()
-                            .bg(theme::canvas())
-                            .border_1()
-                            .border_color(theme::focus()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .child(theme::appearance().label()),
-                    )
-                    .child(picker_chevron(self.appearance_menu_open)),
-            )
-            .when(self.appearance_menu_open, |wrapper| {
-                wrapper.child(picker_popup(self.appearance_menu(cx)))
-            })
-    }
-
-    fn workbench_toolbar(
-        &self,
-        title: String,
-        path: String,
-        sidebar_visible: bool,
-        available: bool,
-        can_add_terminal: bool,
-        wide: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .h(px(chrome::TOOLBAR_HEIGHT))
-            .min_w_0()
-            .flex_shrink_0()
-            .flex()
-            .bg(theme::chrome())
-            .border_b_1()
-            .border_color(theme::edge())
-            .child(
-                div()
-                    .w(px(if sidebar_visible {
-                        self.sidebar_width
-                    } else {
-                        200.0
-                    }))
-                    .h_full()
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .pl(px(chrome::SIDEBAR_INSET))
-                    .border_r_1()
-                    .border_color(theme::edge())
-                    .pr(px(8.0))
-                    .child(self.project_picker(title.clone(), path.clone(), available, cx)),
-            )
-            .child(
-                div()
-                    .h_full()
-                    .flex_1()
-                    .min_w_0()
-                    .px(px(chrome::TOOLBAR_INSET))
-                    .flex()
-                    .items_center()
-                    .gap(px(chrome::GAP))
-                    .when(!sidebar_visible, |toolbar| {
-                        toolbar.child(sidebar_toggle(available, cx))
-                    })
-                    .child(
-                        div()
-                            .id("workspace-path")
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(12.0))
-                            .text_color(theme::ash())
-                            .tooltip(text_tooltip(path.clone()))
-                            .child(if wide {
-                                let parent = std::path::Path::new(&path)
-                                    .parent()
-                                    .and_then(|p| p.file_name())
-                                    .map(|p| p.to_string_lossy().into_owned());
-                                parent.map_or_else(
-                                    || format!("Projects  /  {title}"),
-                                    |parent| format!("Projects  /  {parent}  /  {title}"),
-                                )
-                            } else {
-                                title
-                            }),
-                    )
-                    .child(self.appearance_picker(cx))
-                    .child(
-                        div()
-                            .id("new-terminal")
-                            .debug_selector(|| "new-terminal".into())
-                            .h(px(chrome::MAIN_CONTROL_HEIGHT))
-                            .px(px(12.0))
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .gap(px(12.0))
-                            .rounded(px(chrome::CONTROL_RADIUS))
-                            .border_1()
-                            .border_color(theme::focus())
-                            .bg(theme::focus())
-                            .text_color(theme::on_accent())
-                            .text_size(px(chrome::CONTROL_TEXT_SIZE))
-                            .line_height(px(chrome::CONTROL_LINE_HEIGHT))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .tooltip(text_tooltip(if can_add_terminal {
-                                format!(
-                                    "Open a terminal in this project · {}",
-                                    Keymap::global(cx).hint(Shortcut::NewTerminal)
-                                )
-                            } else if available {
-                                "This project has eight terminal tabs".to_owned()
-                            } else {
-                                "Wait for the workspace to be ready".to_owned()
-                            }))
-                            .when(!can_add_terminal, |button| button.opacity(0.55))
-                            .when(can_add_terminal, |button| {
-                                button
-                                    .tab_index(0)
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(theme::accent_hover()))
-                                    .active(|style| style.bg(theme::accent_pressed()))
-                                    .focus(|style| style.border_color(theme::bone()))
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        if let Some(terminal) = view.active_terminal() {
-                                            terminal.update(cx, |terminal, cx| {
-                                                terminal.add_tab(window, cx)
-                                            });
-                                        }
-                                    }))
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(chrome::SMALL_GAP))
-                                    .child(
-                                        svg()
-                                            .path("icons/plus.svg")
-                                            .size(px(12.0))
-                                            .text_color(theme::on_accent()),
-                                    )
-                                    .child("New terminal"),
-                            )
-                            .when(wide, |button| {
-                                button.child(
-                                    div()
-                                        .font_family(theme::mono())
-                                        .text_size(px(chrome::DETAIL_TEXT_SIZE))
-                                        .child(
-                                            Keymap::global(cx)
-                                                .bindings(Shortcut::NewTerminal)
-                                                .first()
-                                                .map(keymap::compact)
-                                                .unwrap_or_default(),
-                                        ),
-                                )
-                            }),
-                    )
-                    .child(self.checklist_toggle(available, cx)),
             )
     }
 
@@ -2194,6 +2076,7 @@ impl TerminalManager {
                     .workspace
                     .as_ref()
                     .is_some_and(|workspace| workspace.active == index);
+                let (branch, changes, (exited, failed)) = self.project_signals(index, cx);
                 div()
                     .id(("choose-project", index))
                     .h(px(chrome::MENU_ROW_HEIGHT))
@@ -2224,6 +2107,31 @@ impl TerminalManager {
                             .truncate()
                             .child(project_name(&project.path)),
                     )
+                    .when_some(branch, |row, branch| {
+                        row.child(
+                            div()
+                                .max_w(px(84.0))
+                                .flex_shrink_0()
+                                .truncate()
+                                .font_family(theme::mono())
+                                .text_size(px(chrome::DETAIL_TEXT_SIZE))
+                                .text_color(theme::ash())
+                                .child(branch),
+                        )
+                    })
+                    .when_some(changes, |row, changes| {
+                        row.child(
+                            div()
+                                .flex_shrink_0()
+                                .font_family(theme::mono())
+                                .text_size(px(chrome::DETAIL_TEXT_SIZE))
+                                .text_color(theme::focus())
+                                .child(changes.to_string()),
+                        )
+                    })
+                    .when(failed > 0 || exited > 0, |row| {
+                        row.child(stopped_shell_mark(failed > 0))
+                    })
                     .child(
                         div()
                             .w(px(chrome::ICON_SIZE))
@@ -2233,31 +2141,46 @@ impl TerminalManager {
             }))
             .child(
                 div()
-                    .id("selector-add-project")
-                    .h(px(chrome::MENU_ROW_HEIGHT))
-                    .px(px(chrome::COMPACT_GAP))
-                    .flex()
-                    .items_center()
-                    .rounded(px(chrome::CONTROL_RADIUS))
-                    .border_1()
-                    .border_color(gpui::rgba(0))
-                    .when(
-                        self.selector_selected
-                            == self
-                                .workspace
-                                .as_ref()
-                                .map_or(0, |workspace| workspace.projects.len()),
-                        |row| row.bg(theme::selection()).border_color(theme::focus()),
-                    )
-                    .when(!self.picker_pending, |row| {
-                        row.cursor_pointer()
-                            .hover(|style| style.bg(theme::panel_hover()))
-                            .on_click(
-                                cx.listener(|view, _, window, cx| view.choose_project(window, cx)),
+                    .mt(px(4.0))
+                    .pt(px(4.0))
+                    .border_t_1()
+                    .border_color(theme::edge())
+                    .child(
+                        div()
+                            .id("selector-add-project")
+                            .h(px(chrome::MENU_ROW_HEIGHT))
+                            .px(px(chrome::COMPACT_GAP))
+                            .flex()
+                            .items_center()
+                            .gap(px(chrome::COMPACT_GAP))
+                            .rounded(px(chrome::CONTROL_RADIUS))
+                            .border_1()
+                            .border_color(gpui::rgba(0))
+                            .when(
+                                self.selector_selected
+                                    == self
+                                        .workspace
+                                        .as_ref()
+                                        .map_or(0, |workspace| workspace.projects.len()),
+                                |row| row.bg(theme::selection()).border_color(theme::focus()),
                             )
-                    })
-                    .when(self.picker_pending, |row| row.opacity(0.55))
-                    .child("Add project folder…"),
+                            .when(!self.picker_pending, |row| {
+                                row.cursor_pointer()
+                                    .hover(|style| style.bg(theme::panel_hover()))
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.choose_project(window, cx)
+                                    }))
+                            })
+                            .when(self.picker_pending, |row| row.opacity(0.55))
+                            .child(
+                                svg()
+                                    .path("icons/plus.svg")
+                                    .size(px(14.0))
+                                    .flex_shrink_0()
+                                    .text_color(theme::ash()),
+                            )
+                            .child("Add project folder…"),
+                    ),
             )
     }
 
@@ -2505,6 +2428,23 @@ impl TerminalManager {
                     .projects
                     .get(index)
                     .map_or(0, |project| project.terminal.read(cx).terminal_count());
+                let (branch, changes, (exited, failed)) = self.project_signals(index, cx);
+                let mut detail_parts = Vec::with_capacity(3);
+                if let Some(branch) = branch {
+                    detail_parts.push(branch);
+                }
+                detail_parts.push(format!(
+                    "{count} terminal{}",
+                    if count == 1 { "" } else { "s" }
+                ));
+                if let Some(kind) = self
+                    .projects
+                    .get(index)
+                    .and_then(|project| project.project_kind)
+                {
+                    detail_parts.push(kind.to_owned());
+                }
+                let detail = detail_parts.join(" · ");
                 let menu_owner = cx.weak_entity();
                 let menu_path = project.path.clone();
                 let row = div()
@@ -2583,22 +2523,29 @@ impl TerminalManager {
                             )
                             .child(
                                 div()
+                                    .min_w_0()
+                                    .truncate()
                                     .text_size(px(chrome::DETAIL_TEXT_SIZE))
                                     .font_family(chrome::CHROME_FONT)
                                     .font_weight(FontWeight::NORMAL)
                                     .line_height(px(chrome::DETAIL_LINE_HEIGHT))
                                     .text_color(theme::ash())
-                                    .child(format!(
-                                        "{} terminal{}{}",
-                                        count,
-                                        if count == 1 { "" } else { "s" },
-                                        self.projects
-                                            .get(index)
-                                            .and_then(|project| project.project_kind)
-                                            .map_or_else(String::new, |kind| format!(" · {kind}"))
-                                    )),
+                                    .child(detail),
                             ),
                     )
+                    .when_some(changes, |row, changes| {
+                        row.child(
+                            div()
+                                .flex_shrink_0()
+                                .font_family(theme::mono())
+                                .text_size(px(chrome::DETAIL_TEXT_SIZE))
+                                .text_color(theme::focus())
+                                .child(changes.to_string()),
+                        )
+                    })
+                    .when(failed > 0 || exited > 0, |row| {
+                        row.child(stopped_shell_mark(failed > 0))
+                    })
                     .child({
                         let owner = cx.weak_entity();
                         let path = project.path.clone();
@@ -2829,41 +2776,16 @@ fn project_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-fn picker_trigger(id: &'static str, open: bool) -> gpui::Stateful<gpui::Div> {
+/// Filled dot for a failed terminal, hollow ring for an exited one: differs by shape as well as color.
+fn stopped_shell_mark(failed: bool) -> impl IntoElement {
     div()
-        .id(id)
-        .h(px(chrome::MAIN_CONTROL_HEIGHT))
-        .min_w_0()
-        .px(px(chrome::CONTROL_INSET))
-        .flex()
-        .items_center()
-        .gap(px(chrome::COMPACT_GAP))
-        .rounded(px(chrome::CONTROL_RADIUS))
-        .border_1()
-        .border_color(if open {
-            theme::edge_hard()
-        } else {
-            gpui::rgba(0)
+        .size(px(6.0))
+        .flex_shrink_0()
+        .rounded_full()
+        .when(failed, |dot| dot.bg(theme::error()))
+        .when(!failed, |dot| {
+            dot.border_1().border_color(theme::modified())
         })
-        .bg(if open {
-            theme::selection()
-        } else {
-            gpui::rgba(0)
-        })
-        .font_family(chrome::CHROME_FONT)
-        .font_weight(FontWeight::MEDIUM)
-        .text_size(px(chrome::CONTROL_TEXT_SIZE))
-        .line_height(px(chrome::CONTROL_LINE_HEIGHT))
-        .text_color(theme::bone())
-        .hover(move |style| {
-            style.bg(if open {
-                theme::selection()
-            } else {
-                theme::panel_hover()
-            })
-        })
-        .active(|style| style.bg(theme::selection()))
-        .focus(|style| style.border_color(theme::focus()))
 }
 
 fn picker_chevron(open: bool) -> impl IntoElement {
@@ -2882,7 +2804,7 @@ fn picker_popup(menu: impl IntoElement) -> impl IntoElement {
     // A separate absolute sibling keeps the popup out of trigger sizing and click bubbling.
     div()
         .absolute()
-        .top(px(chrome::MAIN_CONTROL_HEIGHT + chrome::MENU_GAP))
+        .top(px(chrome::TAB_LIST_BUTTON + chrome::MENU_GAP))
         .left_0()
         .child(deferred(anchored().snap_to_window().child(menu)).with_priority(1))
 }
@@ -2944,7 +2866,9 @@ pub(super) fn button(
 fn sidebar_toggle(enabled: bool, cx: &mut Context<TerminalManager>) -> impl IntoElement {
     div()
         .id("toggle-projects")
-        .size(px(chrome::CONTROL_HEIGHT))
+        .size(px(chrome::TAB_LIST_BUTTON))
+        .mr(px(4.0))
+        .flex_shrink_0()
         .flex()
         .items_center()
         .justify_center()
@@ -3119,32 +3043,11 @@ impl Render for TerminalManager {
         let inspector_width = chrome::CHECKLIST_WIDTH.min((viewport - 480.0).max(240.0));
         let sidebar_visible = self.workspace.as_ref().is_some_and(|w| w.sidebar_visible)
             && (!inspector_visible || viewport >= self.sidebar_width + inspector_width + 480.0);
-        let path = self
-            .workspace
-            .as_ref()
-            .map(|workspace| {
-                workspace.projects[workspace.active]
-                    .path
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .unwrap_or_default();
-        let title = self
-            .workspace
-            .as_ref()
-            .map(|workspace| project_name(&workspace.projects[workspace.active].path))
-            .unwrap_or_else(|| "Terminal workspace".into());
         let terminal = self.active_terminal();
         let available = self.workspace.is_some()
             && !self.prompt_pending
             && !self.close_after_save
             && !self.interaction_locked();
-        let can_add_terminal = available
-            && terminal
-                .as_ref()
-                .is_some_and(|terminal| terminal.read(cx).layout_snapshot().0 < MAX_TERMINAL_TABS);
-        let wide_toolbar =
-            f32::from(window.viewport_size().width) >= chrome::WIDE_TOOLBAR_MIN_WIDTH;
         let branch = self
             .active_project()
             .and_then(|project| project.git.read(cx).branch())
@@ -3309,18 +3212,7 @@ impl Render for TerminalManager {
                     view.focus_sidebar(window, cx);
                 }
             }))
-            .child(self.titlebar(window, cx))
-            .when(!self.update_scheduling, |workbench| {
-                workbench.child(self.workbench_toolbar(
-                    title.clone(),
-                    path,
-                    sidebar_visible,
-                    available,
-                    can_add_terminal,
-                    wide_toolbar,
-                    cx,
-                ))
-            })
+            .child(self.titlebar(sidebar_visible, available, window, cx))
             .child(
                 div()
                     .flex_1()
@@ -3669,11 +3561,6 @@ mod tests {
             selector_bounds: None,
             selector_scroll: ScrollHandle::new(),
             selector_selected: 0,
-            appearance_menu_open: false,
-            appearance_focus: cx.focus_handle(),
-            appearance_trigger_focus: cx.focus_handle(),
-            appearance_bounds: None,
-            appearance_selected: 0,
             appearance_revision: 0,
             appearance_saving: false,
             settings: None,
@@ -3839,18 +3726,25 @@ mod tests {
     }
 
     #[gpui::test]
-    fn selectors_keep_their_rendered_geometry_across_themes_and_open_states(
+    fn titlebar_projects_and_selector_keep_geometry_across_themes_and_widths(
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(|cx| {
             crate::fonts::initialize(cx);
             super::super::file_editor::FileEditor::initialize(cx);
         });
-        let (view, cx) = cx.add_window_view(|_, cx| {
+        let (view, cx) = cx.add_window_view(|window, cx| {
             let mut view = fixture(cx);
             view.appearance_saving = true;
             view.workspace.as_mut().unwrap().projects[0].path =
-                "a-project-with-a-name-that-must-truncate-in-the-toolbar".into();
+                "a-project-with-a-name-that-must-truncate-in-the-titlebar".into();
+            view.push_terminal(
+                "a-project-with-a-name-that-must-truncate-in-the-titlebar".into(),
+                1,
+                0,
+                window,
+                cx,
+            );
             view
         });
         let original = theme::appearance();
@@ -3863,15 +3757,15 @@ mod tests {
                 });
                 cx.refresh().unwrap();
                 cx.run_until_parked();
-                let picker = cx.debug_bounds("appearance-picker").unwrap();
-                let project = cx.debug_bounds("project-selector").unwrap();
+                let tab = cx.debug_bounds("project-tab-0").unwrap();
+                let selector = cx.debug_bounds("project-selector").unwrap();
+                let checklist = cx.debug_bounds("toggle-checklist").unwrap();
                 let action = cx.debug_bounds("new-terminal").unwrap();
-                let label = cx.debug_bounds("project-selector-label").unwrap();
-                assert!(label.left() > project.left() + px(chrome::CONTROL_INSET));
-                assert!(label.right() < project.right() - px(chrome::CONTROL_INSET));
-                assert!(project.right() <= picker.left());
-                assert!(picker.right() <= action.left());
-                assert!(action.right() <= px(width));
+                assert!(tab.size.width <= px(chrome::PROJECT_TAB_MAX_WIDTH + 0.5));
+                assert!(tab.right() <= selector.left());
+                assert!(selector.right() < checklist.left());
+                assert!(checklist.right() < px(width));
+                assert!(action.top() >= px(chrome::TITLEBAR_HEIGHT));
                 for appearance in theme::Appearance::ALL {
                     cx.update(|window, cx| {
                         view.update(cx, |view, cx| {
@@ -3879,19 +3773,10 @@ mod tests {
                         });
                     });
                     cx.run_until_parked();
-                    assert_eq!(cx.debug_bounds("appearance-picker").unwrap(), picker);
-                    assert_eq!(cx.debug_bounds("project-selector").unwrap(), project);
+                    assert_eq!(cx.debug_bounds("project-tab-0").unwrap(), tab);
+                    assert_eq!(cx.debug_bounds("project-selector").unwrap(), selector);
+                    assert_eq!(cx.debug_bounds("toggle-checklist").unwrap(), checklist);
                     assert_eq!(cx.debug_bounds("new-terminal").unwrap(), action);
-                    cx.simulate_click(picker.center(), gpui::Modifiers::none());
-                    assert!(view.read_with(cx, |view, _| view.appearance_menu_open));
-                    assert_eq!(cx.debug_bounds("appearance-picker").unwrap(), picker);
-                    assert_eq!(cx.debug_bounds("new-terminal").unwrap(), action);
-                    let menu = cx.debug_bounds("appearance-menu").unwrap();
-                    assert!(menu.top() >= picker.bottom() + px(chrome::MENU_GAP - 1.0));
-                    assert!(menu.left() >= px(0.0) && menu.right() <= px(width));
-                    assert!(menu.bottom() <= px(540.0));
-                    cx.simulate_click(picker.center(), gpui::Modifiers::none());
-                    assert!(!view.read_with(cx, |view, _| view.appearance_menu_open));
                 }
             }
         }
@@ -3928,42 +3813,56 @@ mod tests {
     }
 
     #[gpui::test]
-    fn selector_keyboard_navigation_dismissal_and_mutual_exclusion(cx: &mut gpui::TestAppContext) {
+    fn selector_keyboard_navigation_dismissal_and_titlebar_project_switching(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.update(super::super::file_editor::FileEditor::initialize);
-        let (view, cx) = cx.add_window_view(|_, cx| fixture(cx));
-        let project = cx.debug_bounds("project-selector").unwrap();
-        let picker = cx.debug_bounds("appearance-picker").unwrap();
-        cx.simulate_click(project.center(), gpui::Modifiers::none());
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = fixture(cx);
+            view.saving = true;
+            view.workspace
+                .as_mut()
+                .unwrap()
+                .insert_project("synthetic-project-two".into());
+            view.push_terminal("synthetic-project-one".into(), 1, 0, window, cx);
+            view.push_terminal("synthetic-project-two".into(), 1, 0, window, cx);
+            view
+        });
+        cx.simulate_resize(gpui::size(px(1000.0), px(600.0)));
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        // Clicking the first project tab switches directly without opening the dropdown.
+        let first_tab = cx.debug_bounds("project-tab-0").unwrap();
+        cx.simulate_click(first_tab.center(), gpui::Modifiers::none());
+        assert_eq!(
+            view.read_with(cx, |view, _| view.workspace.as_ref().unwrap().active),
+            0
+        );
+        let selector = cx.debug_bounds("project-selector").unwrap();
+        cx.simulate_click(selector.center(), gpui::Modifiers::none());
         assert!(view.read_with(cx, |view, _| view.selector_open));
         let menu = cx.debug_bounds("project-selector-menu").unwrap();
-        assert_eq!(menu.left(), project.left());
-        assert!(menu.top() >= project.bottom());
+        assert!(menu.top() >= selector.bottom());
         // Shift+Tab never moves the highlight; only Tab does.
         cx.simulate_keystrokes("shift-tab");
         assert_eq!(view.read_with(cx, |view, _| view.selector_selected), 0);
         cx.simulate_keystrokes("tab");
         assert_eq!(view.read_with(cx, |view, _| view.selector_selected), 1);
-        cx.simulate_click(picker.center(), gpui::Modifiers::none());
-        assert!(view.read_with(cx, |view, _| view.appearance_menu_open
-            && !view.selector_open));
         cx.simulate_keystrokes("escape");
         cx.update(|window, cx| {
             view.read_with(cx, |view, _| {
-                assert!(!view.appearance_menu_open);
-                assert!(view.appearance_trigger_focus.is_focused(window));
+                assert!(!view.selector_open);
+                assert!(view.selector_trigger_focus.is_focused(window));
             });
         });
         // GPUI's keystroke helper sends only key-down; buttons activate on key-up.
         cx.simulate_keystrokes("enter");
-        assert!(!view.read_with(cx, |view, _| view.appearance_menu_open));
+        assert!(!view.read_with(cx, |view, _| view.selector_open));
         cx.simulate_event(gpui::KeyUpEvent {
             keystroke: gpui::Keystroke::parse("enter").unwrap(),
         });
-        assert!(view.read_with(cx, |view, _| view.appearance_menu_open));
+        assert!(view.read_with(cx, |view, _| view.selector_open));
         cx.simulate_click(gpui::point(px(400.0), px(450.0)), gpui::Modifiers::none());
-        assert!(!view.read_with(cx, |view, _| view.appearance_menu_open));
-        cx.simulate_click(project.center(), gpui::Modifiers::none());
-        cx.simulate_click(project.center(), gpui::Modifiers::none());
         assert!(!view.read_with(cx, |view, _| view.selector_open));
     }
 
@@ -3977,13 +3876,11 @@ mod tests {
             .update(cx, |view, window, cx| {
                 let previous = theme::appearance();
                 view.appearance_saving = true;
-                view.appearance_menu_open = true;
                 view.choose_appearance(theme::Appearance::Graphite, window, cx);
                 view.choose_appearance(theme::Appearance::Black, window, cx);
                 assert_eq!(theme::appearance(), theme::Appearance::Black);
                 assert_eq!(view.appearance_revision, 2);
                 assert!(view.appearance_saving);
-                assert!(!view.appearance_menu_open);
                 assert_eq!(view.workspace.as_ref().unwrap().projects.len(), 1);
                 theme::set_appearance(previous);
                 super::super::file_editor::FileEditor::apply_appearance(cx);

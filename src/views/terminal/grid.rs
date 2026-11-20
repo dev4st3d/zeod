@@ -422,6 +422,7 @@ impl TerminalView {
         };
         let header = div()
             .id(("pane-header", index))
+            .group("pane-header")
             .debug_selector(move || format!("pane-header-{index}"))
             .track_focus(&self.pane_focus[index])
             .tab_index(0)
@@ -430,7 +431,7 @@ impl TerminalView {
             .flex_shrink_0()
             .flex()
             .items_center()
-            .gap(px(chrome::COMPACT_GAP))
+            .gap(px(chrome::SMALL_GAP))
             .bg(if focused {
                 theme::canvas()
             } else {
@@ -444,8 +445,8 @@ impl TerminalView {
                 gpui::rgba(0)
             })
             .font_family(chrome::CHROME_FONT)
-            .text_size(px(12.0))
-            .line_height(px(chrome::CHROME_LINE_HEIGHT))
+            .text_size(px(11.5))
+            .line_height(px(chrome::DETAIL_LINE_HEIGHT))
             .text_color(if focused { theme::bone() } else { theme::ash() })
             .when(entry.is_some(), |header| {
                 header.cursor(CursorStyle::OpenHand)
@@ -476,7 +477,7 @@ impl TerminalView {
                     .child(
                         svg()
                             .path(entry.icon)
-                            .size(px(chrome::ICON_SIZE))
+                            .size(px(14.0))
                             .flex_shrink_0()
                             .text_color(if focused {
                                 theme::focus()
@@ -510,10 +511,12 @@ impl TerminalView {
                             .items_center()
                             .justify_center()
                             .rounded(px(chrome::CONTROL_RADIUS))
+                            .when(!focused, |button| button.invisible())
+                            .group_hover("pane-header", |button| button.visible())
                             .cursor_pointer()
                             .tab_index(0)
                             .hover(|button| button.bg(theme::panel_hover()))
-                            .focus(|button| button.bg(theme::panel_hover()))
+                            .focus(|button| button.visible().bg(theme::panel_hover()))
                             .tooltip(text_tooltip("Close pane"))
                             // Keep the title bar from starting a drag or taking the click.
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -735,6 +738,7 @@ impl TerminalView {
                         cols,
                         rows,
                         if open { theme::bone() } else { theme::ash() },
+                        true,
                     )),
             )
             .when(open, |wrapper| {
@@ -832,7 +836,7 @@ impl TerminalView {
                         .on_click(cx.listener(move |view, _, window, cx| {
                             view.set_grid_shape(cols, rows, window, cx)
                         }))
-                        .child(layout_glyph(cols, rows, theme::ash()))
+                        .child(layout_glyph(cols, rows, theme::ash(), false))
                         .child(div().flex_1().min_w_0().child(label))
                         .when((cols, rows) == current, |row| row.child(check_mark()))
                 },
@@ -841,8 +845,11 @@ impl TerminalView {
     }
 }
 
-/// A miniature of the grid: a frame with one line per divider.
-fn layout_glyph(cols: u8, rows: u8, color: Rgba) -> impl IntoElement {
+/// A miniature of the grid: a frame with one line per divider. When `split_hint`
+/// is set on the single-pane trigger, two short faint ticks mark the center so
+/// the control reads as a layout switcher rather than an empty box.
+fn layout_glyph(cols: u8, rows: u8, color: Rgba, split_hint: bool) -> impl IntoElement {
+    let hint = split_hint && cols == 1 && rows == 1;
     div()
         .relative()
         .w(px(chrome::LAYOUT_GLYPH_WIDTH))
@@ -851,6 +858,28 @@ fn layout_glyph(cols: u8, rows: u8, color: Rgba) -> impl IntoElement {
         .rounded(px(2.0))
         .border_1()
         .border_color(color)
+        .when(hint, |frame| {
+            let tick = wash(color, 0.55);
+            frame
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(2.0))
+                        .left(relative(0.5))
+                        .w(px(1.0))
+                        .h(px(3.0))
+                        .bg(tick),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .bottom(px(2.0))
+                        .left(relative(0.5))
+                        .w(px(1.0))
+                        .h(px(3.0))
+                        .bg(tick),
+                )
+        })
         .children((1..cols).map(|col| {
             div()
                 .absolute()

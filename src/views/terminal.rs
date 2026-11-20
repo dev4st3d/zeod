@@ -535,6 +535,24 @@ impl TerminalView {
         })
     }
 
+    /// Counts of `(exited, failed)` terminals in this project.
+    pub(crate) fn stopped_terminal_counts(&self, cx: &gpui::App) -> (usize, usize) {
+        let mut exited = 0;
+        let mut failed = 0;
+        for tab in &self.tabs {
+            if let TabContent::Terminal(session) = &tab.content {
+                match session.read(cx).status {
+                    TerminalStatus::Exited(_) => exited += 1,
+                    TerminalStatus::Failed(_) => failed += 1,
+                    TerminalStatus::Dormant
+                    | TerminalStatus::Starting
+                    | TerminalStatus::Running => {}
+                }
+            }
+        }
+        (exited, failed)
+    }
+
     pub(crate) fn has_dirty_files(&self, cx: &gpui::App) -> bool {
         self.tabs
             .iter()
@@ -1540,7 +1558,7 @@ impl Render for TerminalView {
                     TabContent::Diff { title, .. } => (
                         title.clone(),
                         format!("{title} · Read-only diff"),
-                        "icons/file-code.svg",
+                        "icons/diff.svg",
                         None,
                     ),
                 };
@@ -1579,6 +1597,16 @@ impl Render for TerminalView {
             self.snap_host(content, cx)
         });
 
+        let can_add_terminal = self.terminal_count() < MAX_TERMINAL_TABS;
+        let new_terminal_tooltip = if can_add_terminal {
+            format!(
+                "New terminal · {}",
+                Keymap::global(cx).hint(Shortcut::NewTerminal)
+            )
+        } else {
+            "This project has eight terminal tabs".to_owned()
+        };
+
         div()
             .id("workspace-terminal")
             .size_full()
@@ -1601,7 +1629,7 @@ impl Render for TerminalView {
                     .child(
                         div()
                             .id("terminal-tabs")
-                            .flex_1()
+                            .flex_initial()
                             .min_w_0()
                             .h_full()
                             .overflow_x_scroll()
@@ -1610,6 +1638,40 @@ impl Render for TerminalView {
                             .items_center()
                             .children(tabs),
                     )
+                    .child(
+                        div()
+                            .id("new-terminal")
+                            .debug_selector(|| "new-terminal".into())
+                            .size(px(chrome::TAB_LIST_BUTTON))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(chrome::CONTROL_RADIUS))
+                            .border_1()
+                            .border_color(gpui::rgba(0))
+                            .tooltip(text_tooltip(new_terminal_tooltip))
+                            .when(!can_add_terminal, |button| button.opacity(0.45))
+                            .when(can_add_terminal, |button| {
+                                button
+                                    .tab_index(0)
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme::panel_hover()))
+                                    .active(|style| style.bg(theme::selection()))
+                                    .focus(|style| style.border_color(theme::focus()))
+                                    .on_click(
+                                        cx.listener(|view, _, window, cx| view.add_tab(window, cx)),
+                                    )
+                            })
+                            .child(svg().path("icons/plus.svg").size(px(14.0)).text_color(
+                                if can_add_terminal {
+                                    theme::ash()
+                                } else {
+                                    theme::smoke()
+                                },
+                            )),
+                    )
+                    .child(div().flex_1())
                     .child(layout_picker)
                     .when(entries.len() > 1, |header| {
                         header.child(self.tab_list(entries, cx))
@@ -1677,11 +1739,13 @@ fn workspace_tab(
     let drag = grid::PaneDrag::new(id, &label, icon);
     div()
         .id(SharedString::from(format!("terminal-tab-{id}")))
+        .group("workspace-tab")
         .debug_selector(move || format!("terminal-tab-{id}"))
         .h_full()
-        .max_w(px(250.0))
-        .min_w(px(180.0))
-        .px(px(chrome::TAB_INSET))
+        .max_w(px(chrome::TAB_MAX_WIDTH))
+        .min_w(px(chrome::TAB_MIN_WIDTH))
+        .pl(px(chrome::TAB_INSET))
+        .pr(px(chrome::SMALL_GAP))
         .flex_shrink_0()
         .flex()
         .flex_row()
@@ -1749,7 +1813,6 @@ fn workspace_tab(
             div()
                 .min_w_0()
                 .flex_1()
-                .max_w(px(170.0))
                 .overflow_hidden()
                 .text_ellipsis()
                 .whitespace_nowrap()
@@ -1779,7 +1842,7 @@ fn workspace_tab(
         .child(
             div()
                 .id(SharedString::from(format!("close-terminal-tab-{id}")))
-                .size(px(chrome::CONTROL_HEIGHT))
+                .size(px(22.0))
                 .flex_shrink_0()
                 .flex()
                 .items_center()
@@ -1793,10 +1856,19 @@ fn workspace_tab(
                 } else {
                     theme::smoke()
                 })
+                // Inactive close buttons stay quiet until hover or focus; unsaved dots stay visible.
+                .when(!selected && !dirty, |button| button.invisible())
+                .group_hover("workspace-tab", |button| button.visible())
                 .tab_index(0)
                 .cursor_pointer()
                 .hover(|button| button.bg(theme::panel_hover()).text_color(theme::bone()))
-                .focus(|button| button.bg(theme::panel_hover()).text_color(theme::focus()))
+                .focus(|button| {
+                    button
+                        .visible()
+                        .bg(theme::panel_hover())
+                        .text_color(theme::focus())
+                })
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |view, _, window, cx| {
                     cx.stop_propagation();
                     view.close_tab(close_id, window, cx)
@@ -1807,14 +1879,14 @@ fn workspace_tab(
                 )))
                 .child(if dirty {
                     div()
-                        .size(px(10.0))
+                        .size(px(8.0))
                         .rounded_full()
                         .bg(theme::ash())
                         .into_any_element()
                 } else {
                     svg()
                         .path("icons/close.svg")
-                        .size(px(chrome::ICON_SIZE))
+                        .size(px(12.0))
                         .text_color(theme::ash())
                         .into_any_element()
                 }),
@@ -2329,5 +2401,39 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[gpui::test]
+    fn tab_strip_places_new_terminal_beside_compact_tabs_and_reports_stopped_shells(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) =
+            cx.add_window_view(|_, cx| TerminalView::new(PathBuf::from("synthetic-project"), cx));
+        cx.simulate_resize(gpui::size(px(900.0), px(600.0)));
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let tab = cx.debug_bounds("terminal-tab-1").unwrap();
+        let add = cx.debug_bounds("new-terminal").unwrap();
+        assert!(tab.size.width >= px(chrome::TAB_MIN_WIDTH));
+        assert!(tab.size.width < px(180.0));
+        assert!(add.left() >= tab.right());
+        assert!(add.left() < tab.right() + px(24.0));
+        cx.simulate_click(add.center(), Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.terminal_count(), 2);
+            assert_eq!(view.stopped_terminal_counts(cx), (0, 0));
+        });
+        view.update(cx, |view, cx| {
+            if let TabContent::Terminal(session) = &view.tabs[0].content {
+                session.update(cx, |session, _| session.status = TerminalStatus::Exited(0));
+            }
+            if let TabContent::Terminal(session) = &view.tabs[1].content {
+                session.update(cx, |session, _| {
+                    session.status = TerminalStatus::Failed("stopped".into())
+                });
+            }
+            assert_eq!(view.stopped_terminal_counts(cx), (1, 1));
+        });
     }
 }

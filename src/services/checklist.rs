@@ -29,6 +29,27 @@ pub(crate) struct Checklist {
     pub sections: Vec<Section>,
 }
 
+impl Checklist {
+    /// Incomplete leaf tasks across every section, matching per-subtree progress.
+    pub(crate) fn open_count(&self) -> usize {
+        self.sections
+            .iter()
+            .map(|section| {
+                section
+                    .tasks
+                    .iter()
+                    .enumerate()
+                    .filter(|&(index, task)| {
+                        let is_leaf = index + 1 == section.tasks.len()
+                            || section.tasks[index + 1].depth <= task.depth;
+                        is_leaf && !task.done
+                    })
+                    .count()
+            })
+            .sum()
+    }
+}
+
 impl Default for Checklist {
     fn default() -> Self {
         Self {
@@ -253,5 +274,25 @@ mod tests {
         }
         s.normalize();
         assert!(s.tasks.iter().all(|t| t.depth <= MAX_DEPTH));
+    }
+
+    #[test]
+    fn open_count_counts_only_incomplete_leaf_tasks_across_sections() {
+        let mut first = outline();
+        let mut second = Section::new("Second".into());
+        second.add("Follow-up".into(), None);
+        let mut checklist = Checklist {
+            sections: vec![first.clone(), second],
+        };
+        // First section has 3 leaves (First, Second, Sibling); Parent derives from its children.
+        assert_eq!(checklist.open_count(), 4);
+        first.toggle(1);
+        checklist.sections[0] = first;
+        assert_eq!(checklist.open_count(), 3);
+        checklist.sections[0].toggle(2);
+        assert_eq!(checklist.open_count(), 2);
+        checklist.sections[0].toggle(3);
+        checklist.sections[1].toggle(0);
+        assert_eq!(checklist.open_count(), 0);
     }
 }

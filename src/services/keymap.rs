@@ -385,21 +385,6 @@ pub(crate) fn display(keystroke: &Keystroke) -> String {
     display_parts(keystroke).join("+")
 }
 
-/// Short chord for tight controls, for example "Ctrl ⇧ T".
-pub(crate) fn compact(keystroke: &Keystroke) -> String {
-    display_parts(keystroke)
-        .into_iter()
-        .map(|part| {
-            if part == "Shift" {
-                "⇧".to_owned()
-            } else {
-                part
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[derive(Deserialize, Serialize)]
 struct StoredKeymap {
     version: u32,
@@ -506,7 +491,6 @@ mod tests {
         assert_eq!(display(&key("ctrl-alt-down")), "Ctrl+Alt+Down");
         assert_eq!(display(&key("f6")), "F6");
         assert_eq!(display(&key("ctrl-pagedown")), "Ctrl+Page Down");
-        assert_eq!(compact(&key("ctrl-shift-t")), "Ctrl ⇧ T");
         assert_eq!(
             Keymap::default().hint(Shortcut::NewTerminal),
             "Ctrl+Shift+T or Ctrl+`"
