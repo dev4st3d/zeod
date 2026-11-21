@@ -1,5 +1,5 @@
 //! Neutral palettes, plus Stone and Flint as warmer darks.
-//! Slate, Moss, Kiln, and Iris tint a near-black base and pair it with one muted accent.
+//! Slate, Moss, Kiln, Iris, and Umber tint a near-black base and pair it with one muted accent.
 
 use std::cell::Cell;
 
@@ -21,10 +21,11 @@ pub(crate) enum Appearance {
     Moss,
     Kiln,
     Iris,
+    Umber,
 }
 
 impl Appearance {
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::Black,
         Self::Light,
         Self::Graphite,
@@ -35,6 +36,7 @@ impl Appearance {
         Self::Moss,
         Self::Kiln,
         Self::Iris,
+        Self::Umber,
     ];
 
     pub(crate) const fn id(self) -> &'static str {
@@ -49,6 +51,7 @@ impl Appearance {
             Self::Moss => "moss",
             Self::Kiln => "kiln",
             Self::Iris => "iris",
+            Self::Umber => "umber",
         }
     }
     pub(crate) const fn label(self) -> &'static str {
@@ -63,6 +66,7 @@ impl Appearance {
             Self::Moss => "Moss",
             Self::Kiln => "Kiln",
             Self::Iris => "Iris",
+            Self::Umber => "Umber",
         }
     }
     pub(crate) fn from_id(id: &str) -> Option<Self> {
@@ -78,6 +82,7 @@ impl Appearance {
             "moss" => Some(Self::Moss),
             "kiln" => Some(Self::Kiln),
             "iris" => Some(Self::Iris),
+            "umber" => Some(Self::Umber),
             _ => None,
         }
     }
@@ -96,6 +101,7 @@ impl Appearance {
             Self::Moss => &MOSS,
             Self::Kiln => &KILN,
             Self::Iris => &IRIS,
+            Self::Umber => &UMBER,
         }
     }
     pub(crate) fn swatch(self) -> Rgba {
@@ -386,6 +392,31 @@ const IRIS: Palette = Palette {
     diff_added: 0x1b2a22ff,
     diff_removed: 0x2f1f25ff,
     diff_empty: 0x1e1d25ff,
+};
+
+// Deep smoked obsidian-flint base with a matte raw-ochre accent; modified leans copper and errors rose.
+const UMBER: Palette = Palette {
+    canvas: 0x0e0c0aff,
+    chrome: 0x1a1612ff,
+    success: 0xa7c5a1ff,
+    floor: 0x14110eff,
+    panel_hover: 0x231e19ff,
+    edge: 0x363028ff,
+    edge_hard: 0xc6bdb0ff,
+    bone: 0xf2ece2ff,
+    ash: 0xc6bdb0ff,
+    focus: 0xd8b87eff,
+    accent_hover: 0xe6ca96ff,
+    accent_pressed: 0xc2a268ff,
+    on_accent: 0x120f0aff,
+    error: 0xe0a1a5ff,
+    error_wash: 0x2a1d1eff,
+    selection: 0x2e271dff,
+    working: 0xc6bdb0ff,
+    modified: 0xe5b07aff,
+    diff_added: 0x182519ff,
+    diff_removed: 0x2a1d1eff,
+    diff_empty: 0x1a1612ff,
 };
 
 fn palette() -> &'static Palette {
@@ -695,7 +726,7 @@ mod tests {
             ids,
             [
                 "black", "light", "graphite", "charcoal", "flint", "stone", "slate", "moss",
-                "kiln", "iris"
+                "kiln", "iris", "umber"
             ]
         );
         for (index, id) in ids.iter().enumerate() {
@@ -746,6 +777,7 @@ mod tests {
             Appearance::Moss,
             Appearance::Kiln,
             Appearance::Iris,
+            Appearance::Umber,
         ];
         for appearance in accented {
             assert!(appearance.is_dark());
@@ -753,6 +785,8 @@ mod tests {
             assert!(canvas < luminance(FLINT.chrome), "{appearance:?}");
             assert!(canvas > luminance(BLACK.canvas), "{appearance:?}");
         }
+        assert!(luminance(UMBER.canvas) < luminance(FLINT.canvas));
+        assert!(luminance(UMBER.canvas) < luminance(KILN.canvas));
         for (index, appearance) in accented.iter().enumerate() {
             for other in &accented[..index] {
                 assert_ne!(appearance.swatch_accent(), other.swatch_accent());
