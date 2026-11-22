@@ -204,6 +204,41 @@ pub(crate) fn switch_branch(root: &Path, branch: &str) -> Result<(), GitError> {
     }
 }
 
+/// Create and switch to a new local branch at HEAD (including unborn repositories).
+pub(crate) fn create_branch(root: &Path, name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Write a branch name first.".into());
+    }
+    if name.starts_with('-') || name.chars().any(char::is_control) {
+        return Err("Choose a valid branch name.".into());
+    }
+    let valid = run_git(root, &args(&["check-ref-format", "--branch", name]))
+        .map_err(|error| error.to_string())?
+        .success;
+    if !valid {
+        return Err("Choose a valid branch name.".into());
+    }
+    if branches(root)
+        .map_err(|error| error.to_string())?
+        .iter()
+        .any(|existing| existing == name)
+    {
+        return Err("A branch with that name already exists.".into());
+    }
+    // `checkout -b` creates a branch on both normal and unborn repositories without hooks.
+    let output = run_git(
+        root,
+        &args(&["-c", "core.hooksPath=/dev/null", "checkout", "-b", name]),
+    )
+    .map_err(|error| error.to_string())?;
+    if output.success {
+        Ok(())
+    } else {
+        Err("Could not create that branch. Check the name and repository state, then retry.".into())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ChangeRow {
     pub(crate) path: PathBuf,

@@ -4,9 +4,9 @@
 //! manager owns persistence and rebinding so a failed save never blocks typing.
 
 use gpui::{
-    App, Context, Div, EventEmitter, FocusHandle, FontWeight, IntoElement, KeyBinding,
-    KeyDownEvent, Keystroke, MouseButton, Render, ScrollHandle, SharedString, Stateful,
-    Subscription, Window, actions, div, prelude::*, px, svg,
+    App, Bounds, Context, Div, EventEmitter, FocusHandle, FontWeight, IntoElement, KeyBinding,
+    KeyDownEvent, Keystroke, MouseButton, Pixels, Render, ScrollHandle, SharedString, Stateful,
+    Subscription, Task, Window, actions, anchored, div, point, prelude::*, px, svg,
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 
@@ -16,6 +16,7 @@ use crate::services::keymap::{self, Keymap, Shortcut, ShortcutGroup};
 use crate::services::terminal_font::{
     MAX_LINE_HEIGHT, MAX_SIZE, MIN_LINE_HEIGHT, MIN_SIZE, TerminalFont,
 };
+use crate::services::terminal_shell::{self, ShellChoice, TerminalShell};
 use crate::theme;
 use crate::theme::terminal_manager as chrome;
 
@@ -31,6 +32,7 @@ const ROW_BUTTON_WIDTH: f32 = 60.0;
 pub(crate) enum SettingsEvent {
     AppearanceChanged(theme::Appearance),
     FontChanged(TerminalFont),
+    ShellChanged(TerminalShell),
     ShortcutChanged(Shortcut, Keystroke),
     ShortcutReset(Shortcut),
     AllShortcutsReset,
@@ -48,6 +50,10 @@ pub(crate) struct SettingsPanel {
     tab: SettingsTab,
     families: Vec<SharedString>,
     family_cursor: usize,
+    shells: Vec<ShellChoice>,
+    shell_menu_open: bool,
+    shell_cursor: usize,
+    shell_bounds: Option<Bounds<Pixels>>,
     appearance_cursor: usize,
     shortcut_cursor: usize,
     recording: Option<Shortcut>,
@@ -56,13 +62,16 @@ pub(crate) struct SettingsPanel {
     first_stop: FocusHandle,
     last_stop: FocusHandle,
     family_focus: FocusHandle,
+    shell_trigger_focus: FocusHandle,
+    shell_menu_focus: FocusHandle,
     appearance_focus: FocusHandle,
     shortcut_focus: FocusHandle,
     family_scroll: ScrollHandle,
     appearance_scroll: ScrollHandle,
     shortcut_scroll: ScrollHandle,
     _recorder: Option<Subscription>,
-    _observers: [Subscription; 2],
+    _shell_discovery: Task<()>,
+    _observers: [Subscription; 3],
 }
 
 impl EventEmitter<SettingsEvent> for SettingsPanel {}
@@ -78,6 +87,52 @@ impl SettingsPanel {
             .iter()
             .position(|family| *family == current)
             .unwrap_or(0);
+        let current_shell = TerminalShell::global(cx).clone();
+        let mut shells = vec![ShellChoice::system_default()];
+        if let Some(program) = &current_shell.program {
+            shells.push(ShellChoice {
+                shell: current_shell.clone(),
+                label: terminal_shell::shell_label(program),
+                detail: program
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("")
+                    .to_owned(),
+            });
+        }
+        let shell_cursor = shells
+            .iter()
+            .position(|choice| choice.shell.same(&current_shell))
+            .unwrap_or(0);
+        let discovery = cx
+            .background_executor()
+            .spawn(async { terminal_shell::discover_shells() });
+        let shell_discovery = cx.spawn(async move |panel, cx| {
+            let mut discovered = discovery.await;
+            let _ = panel.update(cx, |panel, cx| {
+                let active = TerminalShell::global(cx).clone();
+                if let Some(program) = &active.program
+                    && !discovered.iter().any(|choice| choice.shell.same(&active))
+                {
+                    discovered.push(ShellChoice {
+                        shell: active.clone(),
+                        label: terminal_shell::shell_label(program),
+                        detail: program
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("")
+                            .to_owned(),
+                    });
+                }
+                panel.shells = discovered;
+                panel.shell_cursor = panel
+                    .shells
+                    .iter()
+                    .position(|choice| choice.shell.same(&active))
+                    .unwrap_or(0);
+                cx.notify();
+            });
+        });
         let appearance_cursor = theme::Appearance::ALL
             .iter()
             .position(|appearance| *appearance == theme::appearance())
@@ -86,6 +141,10 @@ impl SettingsPanel {
             tab: SettingsTab::Terminal,
             families,
             family_cursor,
+            shells,
+            shell_menu_open: false,
+            shell_cursor,
+            shell_bounds: None,
             appearance_cursor,
             shortcut_cursor: 0,
             recording: None,
@@ -94,15 +153,19 @@ impl SettingsPanel {
             first_stop: cx.focus_handle(),
             last_stop: cx.focus_handle(),
             family_focus: cx.focus_handle(),
+            shell_trigger_focus: cx.focus_handle(),
+            shell_menu_focus: cx.focus_handle(),
             appearance_focus: cx.focus_handle(),
             shortcut_focus: cx.focus_handle(),
             family_scroll: ScrollHandle::new(),
             appearance_scroll: ScrollHandle::new(),
             shortcut_scroll: ScrollHandle::new(),
             _recorder: None,
+            _shell_discovery: shell_discovery,
             _observers: [
                 cx.observe_global::<Keymap>(|_, cx| cx.notify()),
                 cx.observe_global::<TerminalFont>(|_, cx| cx.notify()),
+                cx.observe_global::<TerminalShell>(|_, cx| cx.notify()),
             ],
         }
     }
@@ -122,9 +185,27 @@ impl SettingsPanel {
         &self.focus
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_shells_for_test(&mut self, shells: Vec<ShellChoice>, cx: &mut Context<Self>) {
+        self.shells = shells;
+        let active = TerminalShell::global(cx);
+        self.shell_cursor = self
+            .shells
+            .iter()
+            .position(|choice| choice.shell.same(active))
+            .unwrap_or(0);
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shell_menu_open(&self) -> bool {
+        self.shell_menu_open
+    }
+
     fn select_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
         if self.tab != tab {
             self.stop_recording();
+            self.shell_menu_open = false;
             self.tab = tab;
             cx.notify();
         }
@@ -154,15 +235,72 @@ impl SettingsPanel {
         }
     }
 
-    fn reset_font(&mut self, cx: &mut Context<Self>) {
+    fn reset_terminal(&mut self, cx: &mut Context<Self>) {
+        self.shell_menu_open = false;
         let font = TerminalFont::default();
-        self.family_cursor = self
-            .families
-            .iter()
-            .position(|family| *family == font.family)
-            .unwrap_or(0);
-        self.family_scroll.scroll_to_item(self.family_cursor);
-        cx.emit(SettingsEvent::FontChanged(font));
+        if *TerminalFont::global(cx) != font {
+            self.family_cursor = self
+                .families
+                .iter()
+                .position(|family| *family == font.family)
+                .unwrap_or(0);
+            self.family_scroll.scroll_to_item(self.family_cursor);
+            cx.emit(SettingsEvent::FontChanged(font));
+        }
+        let shell = TerminalShell::default();
+        if !TerminalShell::global(cx).same(&shell) {
+            self.shell_cursor = 0;
+            cx.emit(SettingsEvent::ShellChanged(shell));
+        }
+        cx.notify();
+    }
+
+    fn set_shell_menu_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.shell_menu_open = open;
+        if open {
+            let active = TerminalShell::global(cx);
+            self.shell_cursor = self
+                .shells
+                .iter()
+                .position(|choice| choice.shell.same(active))
+                .unwrap_or(0);
+            window.focus(&self.shell_menu_focus);
+        } else if self.shell_menu_focus.is_focused(window) {
+            window.focus(&self.shell_trigger_focus);
+        }
+        cx.notify();
+    }
+
+    fn choose_shell(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(choice) = self.shells.get(index).cloned() else {
+            return;
+        };
+        self.shell_cursor = index;
+        self.shell_menu_open = false;
+        window.focus(&self.shell_trigger_focus);
+        if !TerminalShell::global(cx).same(&choice.shell) {
+            cx.emit(SettingsEvent::ShellChanged(choice.shell));
+        }
+        cx.notify();
+    }
+
+    fn on_shell_menu_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let last = self.shells.len().saturating_sub(1);
+        match event.keystroke.key.as_str() {
+            "up" => self.shell_cursor = self.shell_cursor.saturating_sub(1),
+            "down" => self.shell_cursor = (self.shell_cursor + 1).min(last),
+            "home" => self.shell_cursor = 0,
+            "end" => self.shell_cursor = last,
+            "enter" | "space" => self.choose_shell(self.shell_cursor, window, cx),
+            "escape" => self.set_shell_menu_open(false, window, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
         cx.notify();
     }
 
@@ -322,6 +460,11 @@ impl SettingsPanel {
     /// Keep focus movement inside the dialog: Tab and Shift+F6 wrap at either
     /// end instead of reaching the workbench. Shift+Tab never moves focus.
     fn focus_next_control(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.shell_menu_open {
+            self.shell_menu_open = false;
+            window.focus(&self.shell_trigger_focus);
+            cx.notify();
+        }
         window.focus_next();
         if !self.focus.contains_focused(window, cx) {
             window.focus(&self.first_stop);
@@ -330,8 +473,14 @@ impl SettingsPanel {
 
     fn on_dialog_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
+            "escape" if self.shell_menu_open => self.set_shell_menu_open(false, window, cx),
             "escape" => cx.emit(SettingsEvent::Closed),
             "f6" if event.keystroke.modifiers.shift => {
+                if self.shell_menu_open {
+                    self.shell_menu_open = false;
+                    window.focus(&self.shell_trigger_focus);
+                    cx.notify();
+                }
                 window.focus_prev();
                 if !self.focus.contains_focused(window, cx) {
                     window.focus(&self.last_stop);
@@ -444,6 +593,7 @@ impl SettingsPanel {
     fn terminal_tab(
         &self,
         font: &TerminalFont,
+        shell: &TerminalShell,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -585,6 +735,7 @@ impl SettingsPanel {
                                     ),
                             )),
                     )
+                    .child(self.shell_picker(shell, cx))
                     .child(
                         div()
                             .flex_1()
@@ -593,9 +744,220 @@ impl SettingsPanel {
                             .flex_col()
                             .gap(px(chrome::SMALL_GAP))
                             .child(section_label("Preview"))
-                            .child(preview(font)),
+                            .child(preview(font, shell)),
                     ),
             )
+    }
+
+    fn shell_picker(&self, active: &TerminalShell, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = self.shell_menu_open;
+        let current = self
+            .shells
+            .iter()
+            .find(|choice| choice.shell.same(active))
+            .cloned()
+            .unwrap_or_else(|| ShellChoice {
+                shell: active.clone(),
+                label: active.label(),
+                detail: active
+                    .program
+                    .as_deref()
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("")
+                    .to_owned(),
+            });
+        div()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap(px(chrome::SMALL_GAP))
+            .child(
+                div()
+                    .flex()
+                    .items_baseline()
+                    .gap(px(chrome::COMPACT_GAP))
+                    .child(section_label("Default shell"))
+                    .child(hint("Used for new terminals")),
+            )
+            .child(
+                div()
+                    .relative()
+                    .on_children_prepainted(cx.processor(
+                        |view, bounds: Vec<Bounds<Pixels>>, _, _| {
+                            view.shell_bounds = bounds.first().copied();
+                        },
+                    ))
+                    .child(
+                        div()
+                            .id("settings-shell-trigger")
+                            .debug_selector(|| "settings-shell-trigger".into())
+                            .track_focus(&self.shell_trigger_focus)
+                            .h(px(chrome::CONTROL_HEIGHT))
+                            .w_full()
+                            .px(px(chrome::COMPACT_GAP))
+                            .flex()
+                            .items_center()
+                            .gap(px(chrome::COMPACT_GAP))
+                            .rounded(px(chrome::CONTROL_RADIUS))
+                            .border_1()
+                            .border_color(if open { theme::focus() } else { theme::edge() })
+                            .bg(if open {
+                                theme::selection()
+                            } else {
+                                theme::canvas()
+                            })
+                            .tab_index(0)
+                            .cursor_pointer()
+                            .hover(move |style| {
+                                style.bg(if open {
+                                    theme::selection()
+                                } else {
+                                    theme::panel_hover()
+                                })
+                            })
+                            .focus(|style| style.border_color(theme::focus()))
+                            .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                                if matches!(
+                                    event.keystroke.key.as_str(),
+                                    "enter" | "space" | "down"
+                                ) {
+                                    cx.stop_propagation();
+                                    view.set_shell_menu_open(true, window, cx);
+                                }
+                            }))
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.set_shell_menu_open(!view.shell_menu_open, window, cx)
+                            }))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme::bone())
+                                    .child(current.label),
+                            )
+                            .when(!current.detail.is_empty(), |row| {
+                                row.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .font_family(theme::mono())
+                                        .text_size(px(chrome::DETAIL_TEXT_SIZE))
+                                        .text_color(theme::ash())
+                                        .child(current.detail),
+                                )
+                            })
+                            .child(
+                                svg()
+                                    .path(if open {
+                                        "icons/chevron-up.svg"
+                                    } else {
+                                        "icons/chevron-down.svg"
+                                    })
+                                    .size(px(12.0))
+                                    .flex_shrink_0()
+                                    .text_color(theme::ash()),
+                            ),
+                    ),
+            )
+    }
+
+    fn shell_menu(
+        &self,
+        active: &TerminalShell,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("settings-shell-menu")
+            .debug_selector(|| "settings-shell-menu".into())
+            .track_focus(&self.shell_menu_focus)
+            .occlude()
+            .w(px(width))
+            .max_h(px(220.0))
+            .overflow_y_scroll()
+            .p(px(chrome::MENU_INSET))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .rounded(px(chrome::CONTROL_RADIUS))
+            .bg(theme::panel_lift())
+            .border_1()
+            .border_color(theme::edge_hard())
+            .font_family(chrome::CHROME_FONT)
+            .text_size(px(chrome::CONTROL_TEXT_SIZE))
+            .line_height(px(chrome::CONTROL_LINE_HEIGHT))
+            .text_color(theme::bone())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down_out(
+                cx.listener(|view, event: &gpui::MouseDownEvent, window, cx| {
+                    if view
+                        .shell_bounds
+                        .is_some_and(|bounds| bounds.contains(&event.position))
+                    {
+                        return;
+                    }
+                    view.set_shell_menu_open(false, window, cx);
+                }),
+            )
+            .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                view.on_shell_menu_key(event, window, cx)
+            }))
+            .children(self.shells.iter().enumerate().map(|(index, choice)| {
+                let current = choice.shell.same(active);
+                let highlighted = self.shell_cursor == index;
+                div()
+                    .id(("settings-shell-option", index))
+                    .debug_selector(move || format!("settings-shell-option-{index}"))
+                    .h(px(chrome::OPTION_ROW_HEIGHT))
+                    .w_full()
+                    .px(px(chrome::COMPACT_GAP))
+                    .flex()
+                    .items_center()
+                    .gap(px(chrome::COMPACT_GAP))
+                    .rounded(px(chrome::CONTROL_RADIUS))
+                    .border_1()
+                    .border_color(if highlighted {
+                        theme::focus()
+                    } else {
+                        gpui::rgba(0)
+                    })
+                    .bg(if highlighted {
+                        theme::selection()
+                    } else {
+                        gpui::rgba(0)
+                    })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::panel_hover()))
+                    .on_click(
+                        cx.listener(move |view, _, window, cx| {
+                            view.choose_shell(index, window, cx)
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(choice.label.clone()),
+                    )
+                    .when(!choice.detail.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .flex_shrink_0()
+                                .font_family(theme::mono())
+                                .text_size(px(chrome::DETAIL_TEXT_SIZE))
+                                .text_color(theme::ash())
+                                .child(choice.detail.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .w(px(chrome::ICON_SIZE))
+                            .flex_shrink_0()
+                            .when(current, |mark| mark.child(check_mark())),
+                    )
+            }))
     }
 
     fn keyboard_tab(
@@ -913,14 +1275,15 @@ impl SettingsPanel {
     fn footer(
         &self,
         font: &TerminalFont,
+        shell: &TerminalShell,
         keymap: &Keymap,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let (reset_label, resettable, hint_text) = match self.tab {
             SettingsTab::Terminal => (
-                "Reset font",
-                !font.is_default(),
-                "Changes apply to every terminal immediately.",
+                "Reset terminal",
+                !font.is_default() || !shell.is_default(),
+                "Font applies immediately · Shell applies to new terminals.",
             ),
             SettingsTab::Appearance => (
                 "Reset theme",
@@ -946,7 +1309,7 @@ impl SettingsPanel {
             .child(
                 button("settings-reset", reset_label, resettable).when(resettable, |reset| {
                     reset.on_click(cx.listener(move |view, _, _, cx| match tab {
-                        SettingsTab::Terminal => view.reset_font(cx),
+                        SettingsTab::Terminal => view.reset_terminal(cx),
                         SettingsTab::Appearance => view.reset_appearance(cx),
                         SettingsTab::Keyboard => view.reset_all_shortcuts(cx),
                     }))
@@ -977,9 +1340,12 @@ impl Render for SettingsPanel {
         let height = chrome::DIALOG_HEIGHT
             .min((f32::from(viewport.height) - chrome::DIALOG_MARGIN * 2.0).max(320.0));
         let font = TerminalFont::global(cx).clone();
+        let shell = TerminalShell::global(cx).clone();
         let keymap = Keymap::global(cx).clone();
         div()
             .id("settings-scrim")
+            .key_context(DIALOG_CONTEXT)
+            .track_focus(&self.focus)
             .absolute()
             .inset_0()
             .flex()
@@ -987,6 +1353,12 @@ impl Render for SettingsPanel {
             .justify_center()
             .bg(theme::scrim())
             .occlude()
+            .on_action(cx.listener(|view, _: &FocusNextControl, window, cx| {
+                view.focus_next_control(window, cx)
+            }))
+            .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                view.on_dialog_key(event, window, cx)
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|view, _, _, cx| {
@@ -998,8 +1370,6 @@ impl Render for SettingsPanel {
             .child(
                 div()
                     .id("settings-dialog")
-                    .key_context(DIALOG_CONTEXT)
-                    .track_focus(&self.focus)
                     .w(px(width))
                     .h(px(height))
                     .flex()
@@ -1015,18 +1385,12 @@ impl Render for SettingsPanel {
                     .line_height(px(chrome::CONTROL_LINE_HEIGHT))
                     .text_color(theme::bone())
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_action(cx.listener(|view, _: &FocusNextControl, window, cx| {
-                        view.focus_next_control(window, cx)
-                    }))
-                    .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
-                        view.on_dialog_key(event, window, cx)
-                    }))
                     .child(self.header(cx))
                     .child(self.tab_strip(cx))
                     .child(match self.tab {
-                        SettingsTab::Terminal => {
-                            self.terminal_tab(&font, window, cx).into_any_element()
-                        }
+                        SettingsTab::Terminal => self
+                            .terminal_tab(&font, &shell, window, cx)
+                            .into_any_element(),
                         SettingsTab::Appearance => {
                             self.appearance_tab(window, cx).into_any_element()
                         }
@@ -1034,7 +1398,25 @@ impl Render for SettingsPanel {
                             self.keyboard_tab(&keymap, window, cx).into_any_element()
                         }
                     })
-                    .child(self.footer(&font, &keymap, cx)),
+                    .child(self.footer(&font, &shell, &keymap, cx)),
+            )
+            // Painted as a sibling after the dialog rather than via nested `deferred(...)`:
+            // SettingsPanel itself renders inside TerminalManager's deferred layer, and
+            // GPUI 0.2.2 panics if `defer_draw` is called during deferred drawing.
+            .when(
+                self.tab == SettingsTab::Terminal && self.shell_menu_open,
+                |scrim| {
+                    let width = self
+                        .shell_bounds
+                        .map_or(280.0, |bounds| f32::from(bounds.size.width))
+                        .max(220.0);
+                    let mut popup = anchored().snap_to_window_with_margin(px(chrome::GAP));
+                    if let Some(bounds) = self.shell_bounds {
+                        popup = popup
+                            .position(point(bounds.left(), bounds.bottom() + px(chrome::MENU_GAP)));
+                    }
+                    scrim.child(popup.child(self.shell_menu(&shell, width, cx)))
+                },
             )
     }
 }
@@ -1275,7 +1657,7 @@ fn row_button(id: (&'static str, usize), label: &'static str) -> Stateful<Div> {
 }
 
 /// Sample output in the chosen font, with ambiguous glyphs that expose a poor fit.
-fn preview(font: &TerminalFont) -> impl IntoElement {
+fn preview(font: &TerminalFont, shell: &TerminalShell) -> impl IntoElement {
     div()
         .id("settings-preview")
         .flex_1()
@@ -1294,7 +1676,11 @@ fn preview(font: &TerminalFont) -> impl IntoElement {
         .child(
             div()
                 .flex()
-                .child(div().text_color(theme::focus()).child("PS C:\\project> "))
+                .child(
+                    div()
+                        .text_color(theme::focus())
+                        .child(shell.prompt_preview()),
+                )
                 .child("cargo test"),
         )
         .child(
@@ -1662,5 +2048,47 @@ mod tests {
             )]
         );
         theme::set_appearance(original);
+    }
+
+    #[gpui::test]
+    fn shell_picker_reports_changes_and_escape_closes_menu_first(cx: &mut TestAppContext) {
+        let (panel, events, cx) = open(cx);
+        let custom = TerminalShell::with_program(Some(std::path::PathBuf::from(
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+        )));
+        cx.update(|window, app| {
+            panel.update(app, |panel, cx| {
+                panel.shells = vec![
+                    ShellChoice::system_default(),
+                    ShellChoice {
+                        shell: custom.clone(),
+                        label: "PowerShell 7".into(),
+                        detail: "pwsh.exe".into(),
+                    },
+                ];
+                panel.set_shell_menu_open(true, window, cx);
+            });
+        });
+        cx.simulate_keystrokes("escape");
+        assert!(events.borrow().is_empty());
+        panel.read_with(cx, |panel, _| assert!(!panel.shell_menu_open));
+
+        cx.update(|window, app| {
+            panel.update(app, |panel, cx| {
+                panel.set_shell_menu_open(true, window, cx);
+            });
+        });
+        cx.simulate_keystrokes("down enter");
+        assert_eq!(
+            events.borrow().as_slice(),
+            [SettingsEvent::ShellChanged(custom.clone())]
+        );
+        cx.update(|_, app| app.set_global(custom));
+        events.borrow_mut().clear();
+        panel.update(cx, |panel, cx| panel.reset_terminal(cx));
+        assert_eq!(
+            events.borrow().as_slice(),
+            [SettingsEvent::ShellChanged(TerminalShell::default())]
+        );
     }
 }

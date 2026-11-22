@@ -936,6 +936,10 @@ pub(super) struct GitPanel {
     branch_picker: bool,
     branch_selected: usize,
     branch_bounds: Option<Bounds<Pixels>>,
+    branch_creating: bool,
+    branch_input: Entity<InputState>,
+    branch_error: Option<String>,
+    _branch_subscription: Subscription,
     switching: bool,
     status: Option<GitStatus>,
     loading: bool,
@@ -997,6 +1001,21 @@ impl GitPanel {
                 cx.notify();
             },
         );
+        let branch_input = cx.new(|cx| InputState::new(window, cx).placeholder("New branch name…"));
+        let branch_subscription = cx.subscribe_in(
+            &branch_input,
+            window,
+            |view, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => view.submit_create_branch(window, cx),
+                InputEvent::Change => {
+                    if view.branch_error.is_some() {
+                        view.branch_error = None;
+                        cx.notify();
+                    }
+                }
+                _ => {}
+            },
+        );
         Self {
             root,
             commit_input,
@@ -1017,6 +1036,10 @@ impl GitPanel {
             branch_picker: false,
             branch_selected: 0,
             branch_bounds: None,
+            branch_creating: false,
+            branch_input,
+            branch_error: None,
+            _branch_subscription: branch_subscription,
             switching: false,
             status: None,
             loading: false,
@@ -1082,6 +1105,7 @@ impl GitPanel {
                             old.head != repository.head
                                 || old.upstream != repository.upstream
                                 || old.ahead != repository.ahead
+                                || old.behind != repository.behind
                         });
                         view.branches = branches;
                         view.repository = Some(repository);
@@ -1358,6 +1382,8 @@ impl GitPanel {
     /// Opens the branch select with the current branch highlighted, or closes it.
     fn toggle_branch_picker(&mut self) {
         self.branch_picker = !self.branch_picker;
+        self.branch_creating = false;
+        self.branch_error = None;
         if self.branch_picker {
             self.branch_selected = self
                 .branch()
@@ -1366,9 +1392,89 @@ impl GitPanel {
         }
     }
 
+    fn begin_create_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.git_busy() || self.loading || self.not_repository {
+            return;
+        }
+        self.branch_creating = true;
+        self.branch_error = None;
+        self.branch_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn cancel_create_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.branch_creating = false;
+        self.branch_error = None;
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    fn submit_create_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.git_busy() || self.loading || self.not_repository {
+            return;
+        }
+        let name = self.branch_input.read(cx).value().trim().to_owned();
+        if name.is_empty() {
+            self.branch_error = Some("Write a branch name first.".into());
+            cx.notify();
+            return;
+        }
+        let Some(terminal) = self.terminal.upgrade() else {
+            return;
+        };
+        if !terminal.update(cx, |terminal, cx| terminal.begin_file_change(true, cx)) {
+            self.branch_error = Some("Wait for other file operations, then retry.".into());
+            cx.notify();
+            return;
+        }
+        self.switching = true;
+        self.branch_error = None;
+        self.operation_error = None;
+        self.notice = None;
+        let root = self.root.clone();
+        let branch_name = name.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { project_git::create_branch(&root, &branch_name) });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = task.await;
+            let _ = terminal.update(cx, |terminal, cx| terminal.end_file_change(cx));
+            let _ = view.update_in(cx, |view, window, cx| {
+                view.switching = false;
+                match result {
+                    Ok(()) => {
+                        view.branch_creating = false;
+                        view.branch_picker = false;
+                        view.branch_error = None;
+                        view.branch_input
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        view.notice = Some(format!("Switched to new branch {name}."));
+                        view.refresh(cx);
+                        cx.emit(ProjectPanelEvent::BranchChanged);
+                        window.focus(&view.focus);
+                    }
+                    Err(error) => {
+                        view.branch_error = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// Keyboard handling while the branch select is open; returns whether the key was used.
-    fn branch_picker_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
-        let last = self.branches.len().saturating_sub(1);
+    fn branch_picker_key(
+        &mut self,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let last = self.branches.len();
         match key {
             "up" => self.branch_selected = self.branch_selected.saturating_sub(1),
             "down" => self.branch_selected = (self.branch_selected + 1).min(last),
@@ -1377,9 +1483,15 @@ impl GitPanel {
             "enter" | "space" => {
                 if let Some(branch) = self.branches.get(self.branch_selected).cloned() {
                     self.choose_branch(branch, cx);
+                } else {
+                    self.begin_create_branch(window, cx);
                 }
             }
-            "escape" | "b" => self.branch_picker = false,
+            "escape" | "b" => {
+                self.branch_picker = false;
+                self.branch_creating = false;
+                self.branch_error = None;
+            }
             _ => return false,
         }
         true
@@ -1393,9 +1505,15 @@ impl GitPanel {
             cx.notify();
             return;
         }
+        if self.branch_picker && self.branch_creating && event.keystroke.key == "escape" {
+            self.cancel_create_branch(window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if self.branch_picker
+            && !self.branch_creating
             && self.focus.is_focused(window)
-            && self.branch_picker_key(&event.keystroke.key, cx)
+            && self.branch_picker_key(&event.keystroke.key, window, cx)
         {
             cx.stop_propagation();
             cx.notify();

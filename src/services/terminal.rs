@@ -83,7 +83,17 @@ pub struct TerminalWorker {
 
 impl TerminalWorker {
     /// Starts worker setup on a background thread and returns immediately.
+    #[cfg(test)]
     pub fn spawn(working_directory: PathBuf, size: TerminalSize) -> Self {
+        Self::spawn_with_shell(working_directory, size, None)
+    }
+
+    /// Starts a worker using an explicit shell executable, or the OS default when `None`.
+    pub fn spawn_with_shell(
+        working_directory: PathBuf,
+        size: TerminalSize,
+        shell: Option<PathBuf>,
+    ) -> Self {
         let (commands, command_rx) = mpsc::sync_channel(COMMAND_CAPACITY);
         let (event_tx, events) = async_channel::bounded(EVENT_CAPACITY);
         let shutdown_requested = Arc::new(AtomicBool::new(false));
@@ -96,6 +106,7 @@ impl TerminalWorker {
                     run_terminal(
                         working_directory,
                         size,
+                        shell,
                         command_rx,
                         shutdown_requested,
                         worker_events,
@@ -155,6 +166,7 @@ impl Drop for TerminalWorker {
 fn run_terminal(
     working_directory: PathBuf,
     size: TerminalSize,
+    shell_program: Option<PathBuf>,
     commands: mpsc::Receiver<TerminalCommand>,
     shutdown_requested: Arc<AtomicBool>,
     events: Sender<TerminalEvent>,
@@ -169,6 +181,30 @@ fn run_terminal(
         return;
     }
 
+    let (shell, mut command) = match shell_program {
+        Some(program) => {
+            if !program.is_file() {
+                send_event(
+                    &events,
+                    TerminalEvent::Error {
+                        summary: "The selected shell is no longer available. Choose another shell in Settings.".to_owned(),
+                    },
+                );
+                return;
+            }
+            let label = program
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("Shell")
+                .to_owned();
+            let mut command = CommandBuilder::new(&program);
+            command.args(super::terminal_shell::shell_args(&program));
+            (label, command)
+        }
+        None => (default_shell_label(), CommandBuilder::new_default_prog()),
+    };
+
     let pty_system = native_pty_system();
     let Ok(pair) = pty_system.openpty(size.as_pty()) else {
         send_event(
@@ -180,8 +216,6 @@ fn run_terminal(
         return;
     };
 
-    let shell = default_shell_label();
-    let mut command = CommandBuilder::new_default_prog();
     command.cwd(&working_directory);
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
@@ -367,6 +401,7 @@ mod tests {
         run_terminal(
             PathBuf::from("definitely-missing-terminal-workspace"),
             TerminalSize::default(),
+            None,
             command_rx,
             Arc::new(AtomicBool::new(false)),
             event_tx,
@@ -375,6 +410,29 @@ mod tests {
             events.recv_blocking().unwrap(),
             TerminalEvent::Error {
                 summary: "The workspace folder is unavailable.".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn missing_shell_executable_reports_recoverable_error() {
+        let (commands, command_rx) = mpsc::sync_channel(1);
+        let (event_tx, events) = async_channel::bounded(2);
+        drop(commands);
+        run_terminal(
+            std::env::temp_dir(),
+            TerminalSize::default(),
+            Some(PathBuf::from("definitely-missing-shell.exe")),
+            command_rx,
+            Arc::new(AtomicBool::new(false)),
+            event_tx,
+        );
+        assert_eq!(
+            events.recv_blocking().unwrap(),
+            TerminalEvent::Error {
+                summary:
+                    "The selected shell is no longer available. Choose another shell in Settings."
+                        .to_owned(),
             }
         );
     }

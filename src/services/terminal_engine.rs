@@ -1,7 +1,7 @@
 //! Alacritty terminal state and protocol handling, independent of the UI and PTY.
 
 use std::borrow::Cow;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -34,6 +34,7 @@ pub(crate) struct TerminalCell {
     pub(crate) selected: bool,
     pub(crate) wide: bool,
     pub(crate) wide_spacer: bool,
+    pub(crate) hyperlink: Option<Arc<str>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +102,7 @@ impl EventListener for EventSender {
             Event::PtyWrite(_)
             | Event::Title(_)
             | Event::ResetTitle
+            | Event::Bell
             | Event::ColorRequest(_, _)
             | Event::TextAreaSizeRequest(_) => {
                 let _ = self.0.send(event);
@@ -112,7 +114,6 @@ impl EventListener for EventSender {
             | Event::MouseCursorDirty
             | Event::CursorBlinkingChange
             | Event::Wakeup
-            | Event::Bell
             | Event::Exit
             | Event::ChildExit(_) => {}
         }
@@ -153,6 +154,7 @@ pub(crate) struct TerminalEngine {
     parser: Processor,
     events: mpsc::Receiver<Event>,
     title: String,
+    bell: bool,
     cell_width: u16,
     cell_height: u16,
     default_foreground: Rgb,
@@ -174,6 +176,7 @@ impl TerminalEngine {
             parser: Processor::new(),
             events,
             title: String::new(),
+            bell: false,
             cell_width: 1,
             cell_height: 1,
             default_foreground: Rgb {
@@ -222,6 +225,7 @@ impl TerminalEngine {
                         .collect();
                 }
                 Event::ResetTitle => self.title.clear(),
+                Event::Bell => self.bell = true,
                 Event::ColorRequest(index, format) => {
                     replies.extend_from_slice(format(self.color_rgb(index)).as_bytes());
                 }
@@ -242,7 +246,6 @@ impl TerminalEngine {
                 | Event::MouseCursorDirty
                 | Event::CursorBlinkingChange
                 | Event::Wakeup
-                | Event::Bell
                 | Event::Exit
                 | Event::ChildExit(_) => {}
             }
@@ -282,6 +285,11 @@ impl TerminalEngine {
 
     pub(crate) fn title(&self) -> &str {
         &self.title
+    }
+
+    /// Returns whether the terminal rang the bell (`\x07`) since the last check.
+    pub(crate) fn take_bell(&mut self) -> bool {
+        std::mem::take(&mut self.bell)
     }
 
     pub(crate) fn modes(&self) -> TerminalModes {
@@ -373,11 +381,62 @@ impl TerminalEngine {
         )
     }
 
+    /// Snapshot a single visible viewport row without copying the entire screen.
+    pub(crate) fn row_cells(&self, row: usize) -> Option<Vec<TerminalCell>> {
+        if row >= self.term.screen_lines() {
+            return None;
+        }
+        let grid = self.term.grid();
+        let line = Line(row as i32 - grid.display_offset() as i32);
+        let cols = self.term.columns();
+        let mut cells = Vec::with_capacity(cols);
+        let mut last_hyperlink: Option<Arc<str>> = None;
+        for col in 0..cols {
+            let cell = &grid[line][Column(col)];
+            let flags = cell.flags;
+            let wide_spacer =
+                flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
+            let text = if flags.contains(Flags::HIDDEN) || wide_spacer {
+                Cow::Borrowed("")
+            } else {
+                cell_text(cell.c, cell.zerowidth().unwrap_or_default())
+            };
+            let hyperlink = cell.hyperlink().map(|link| {
+                if let Some(existing) = &last_hyperlink
+                    && existing.as_ref() == link.uri()
+                {
+                    Arc::clone(existing)
+                } else {
+                    let shared: Arc<str> = Arc::from(link.uri());
+                    last_hyperlink = Some(Arc::clone(&shared));
+                    shared
+                }
+            });
+            cells.push(TerminalCell {
+                text,
+                fg: self.render_color(cell.fg),
+                bg: self.render_color(cell.bg),
+                bold: flags.contains(Flags::BOLD),
+                italic: flags.contains(Flags::ITALIC),
+                underline: flags.intersects(Flags::ALL_UNDERLINES),
+                strikethrough: flags.contains(Flags::STRIKEOUT),
+                dim: flags.contains(Flags::DIM),
+                inverse: flags.contains(Flags::INVERSE),
+                selected: false,
+                wide: flags.contains(Flags::WIDE_CHAR),
+                wide_spacer,
+                hyperlink,
+            });
+        }
+        Some(cells)
+    }
+
     pub(crate) fn snapshot(&self) -> TerminalSnapshot {
         let content = self.term.renderable_content();
         let mut rows: Vec<Vec<TerminalCell>> = (0..self.term.screen_lines())
             .map(|_| Vec::with_capacity(self.term.columns()))
             .collect();
+        let mut last_hyperlink: Option<Arc<str>> = None;
         for indexed in content.display_iter {
             let row = (indexed.point.line.0 + content.display_offset as i32) as usize;
             let cell = indexed.cell;
@@ -395,6 +454,17 @@ impl TerminalEngine {
                         && selection
                             .contains(Point::new(indexed.point.line, indexed.point.column + 1)))
             });
+            let hyperlink = cell.hyperlink().map(|link| {
+                if let Some(existing) = &last_hyperlink
+                    && existing.as_ref() == link.uri()
+                {
+                    Arc::clone(existing)
+                } else {
+                    let shared: Arc<str> = Arc::from(link.uri());
+                    last_hyperlink = Some(Arc::clone(&shared));
+                    shared
+                }
+            });
             rows[row].push(TerminalCell {
                 text,
                 fg: self.render_color(cell.fg),
@@ -408,6 +478,7 @@ impl TerminalEngine {
                 selected,
                 wide: flags.contains(Flags::WIDE_CHAR),
                 wide_spacer,
+                hyperlink,
             });
         }
         let cursor_row = content.cursor.point.line.0 + content.display_offset as i32;
@@ -618,6 +689,21 @@ mod tests {
         action: MouseAction,
     ) -> Option<Vec<u8>> {
         engine.mouse_report(button, action, 2, 4, MouseModifiers::default())
+    }
+
+    #[test]
+    fn bell_and_osc8_hyperlinks_are_surfaced_without_leaking_state() {
+        let mut engine = TerminalEngine::new(4, 40);
+        assert!(!engine.take_bell());
+        engine.feed(b"done\x07");
+        assert!(engine.take_bell());
+        assert!(!engine.take_bell());
+
+        engine.feed(b"\r\n\x1b]8;;https://example.com\x07link\x1b]8;;\x07 plain");
+        let row = engine.row_cells(1).unwrap();
+        assert_eq!(row[0].hyperlink.as_deref(), Some("https://example.com"));
+        assert_eq!(row[3].hyperlink.as_deref(), Some("https://example.com"));
+        assert_eq!(row[4].hyperlink, None);
     }
 
     #[test]

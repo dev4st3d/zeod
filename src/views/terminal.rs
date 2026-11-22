@@ -7,19 +7,25 @@ use std::{
 };
 
 use gpui::{
-    Bounds, ClipboardItem, Context, Corner, CursorStyle, Entity, EventEmitter, FocusHandle,
-    FontWeight, IntoElement, KeyDownEvent, Keystroke, MouseButton, Pixels, Render, SharedString,
-    Subscription, Task, Window, anchored, deferred, div, prelude::*, px, svg,
+    AnyWindowHandle, Bounds, ClipboardItem, Context, Corner, CursorStyle, Entity, EventEmitter,
+    FocusHandle, FontWeight, IntoElement, KeyDownEvent, Keystroke, MouseButton, Pixels, Point,
+    Render, SharedString, Subscription, Task, Window, anchored, deferred, div, prelude::*, px, svg,
+};
+use gpui_component::{
+    input::{Input, InputEvent, InputState},
+    menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
 };
 
 use super::file_editor::{FileEditor, FileEditorEvent};
 use super::image_viewer::{ImageViewer, ImageViewerEvent};
-use super::terminal_manager::{check_mark, text_tooltip};
+use super::terminal_manager::{attention_mark, check_mark, text_tooltip};
 use crate::services::keymap::{Keymap, Shortcut};
 use crate::services::terminal::{TerminalEvent, TerminalSize, TerminalWorker};
 use crate::services::terminal_engine::TerminalEngine;
 use crate::services::terminal_font::TerminalFont;
 use crate::services::terminal_grid::{self, TerminalGrid};
+use crate::services::terminal_links::ResolvedLink;
+use crate::services::terminal_shell::TerminalShell;
 use crate::theme;
 use crate::theme::terminal_manager as chrome;
 
@@ -55,19 +61,44 @@ enum TerminalStatus {
     Failed(String),
 }
 
+pub(super) enum TerminalSessionEvent {
+    OpenFile {
+        path: PathBuf,
+        line: Option<u32>,
+        column: Option<u32>,
+        window: AnyWindowHandle,
+    },
+    AttentionChanged,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct HoveredLink {
+    pub(super) row: usize,
+    pub(super) cols: Range<usize>,
+    pub(super) resolved: ResolvedLink,
+}
+
 struct TerminalSession {
     workspace: PathBuf,
     shell: String,
+    custom_title: Option<String>,
     worker: Option<TerminalWorker>,
     engine: TerminalEngine,
     size: TerminalSize,
     status: TerminalStatus,
     generation: u64,
     focus_handle: FocusHandle,
+    is_focused: bool,
+    needs_attention: bool,
     geometry: Option<TerminalGeometry>,
     selecting: bool,
     pressed_button: Option<crate::services::terminal_engine::MouseButton>,
     last_mouse_cell: Option<(usize, usize)>,
+    last_pointer: Option<Point<Pixels>>,
+    ctrl_held: bool,
+    hovered_link: Option<HoveredLink>,
+    link_probe_generation: u64,
+    _link_probe_task: Option<Task<()>>,
     composition: String,
     composition_selection: Range<usize>,
     cursor_visible: bool,
@@ -78,21 +109,31 @@ struct TerminalSession {
     _cursor_task: Option<Task<()>>,
 }
 
+impl EventEmitter<TerminalSessionEvent> for TerminalSession {}
+
 impl TerminalSession {
     fn new(workspace: PathBuf, size: TerminalSize, cx: &mut Context<Self>) -> Self {
         Self {
             workspace,
             shell: String::new(),
+            custom_title: None,
             worker: None,
             engine: new_engine(size),
             size,
             status: TerminalStatus::Dormant,
             generation: 1,
             focus_handle: cx.focus_handle(),
+            is_focused: false,
+            needs_attention: false,
             geometry: None,
             selecting: false,
             pressed_button: None,
             last_mouse_cell: None,
+            last_pointer: None,
+            ctrl_held: false,
+            hovered_link: None,
+            link_probe_generation: 0,
+            _link_probe_task: None,
             composition: String::new(),
             composition_selection: 0..0,
             cursor_visible: true,
@@ -129,6 +170,10 @@ impl TerminalSession {
     fn send_input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
         if bytes.is_empty() || !matches!(self.status, TerminalStatus::Running) {
             return;
+        }
+        if self.needs_attention {
+            self.needs_attention = false;
+            cx.emit(TerminalSessionEvent::AttentionChanged);
         }
         self.engine.scroll_to_bottom();
         self.engine.clear_selection();
@@ -199,6 +244,10 @@ impl TerminalSession {
                 TerminalEvent::Output(bytes) => {
                     let replies = self.engine.feed(&bytes);
                     self.write_pty(replies, cx);
+                    if self.engine.take_bell() && !self.is_focused && !self.needs_attention {
+                        self.needs_attention = true;
+                        cx.emit(TerminalSessionEvent::AttentionChanged);
+                    }
                 }
                 TerminalEvent::Exited { code } => self.status = TerminalStatus::Exited(code),
                 TerminalEvent::Error { summary } => {
@@ -236,9 +285,19 @@ impl TerminalSession {
 
     fn restart(&mut self, cx: &mut Context<Self>) {
         self.generation = self.generation.wrapping_add(1).max(1);
-        self.worker = Some(TerminalWorker::spawn(self.workspace.clone(), self.size));
+        let shell = TerminalShell::global(cx).program.clone();
+        self.worker = Some(TerminalWorker::spawn_with_shell(
+            self.workspace.clone(),
+            self.size,
+            shell,
+        ));
         self.engine = new_engine(self.size);
         self._sync_task.take();
+        if self.needs_attention {
+            self.needs_attention = false;
+            cx.emit(TerminalSessionEvent::AttentionChanged);
+        }
+        self.clear_hovered_link();
         self.composition.clear();
         self.composition_selection = 0..0;
         self.selecting = false;
@@ -370,6 +429,13 @@ struct WorkspaceTab {
     id: u64,
     content: TabContent,
     _subscription: Subscription,
+    _session_subscription: Option<Subscription>,
+}
+
+struct TabRename {
+    id: u64,
+    input: Entity<InputState>,
+    _subscription: Subscription,
 }
 
 pub(crate) struct TerminalView {
@@ -381,6 +447,7 @@ pub(crate) struct TerminalView {
     fallback_focus: FocusHandle,
     close_pending: bool,
     files_locked: bool,
+    rename: Option<TabRename>,
     tab_list_open: bool,
     tab_list_focus: FocusHandle,
     tab_list_bounds: Option<Bounds<Pixels>>,
@@ -401,16 +468,50 @@ pub(crate) struct TerminalView {
 }
 
 impl TerminalView {
+    fn subscribe_session(
+        session: &Entity<TerminalSession>,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe(
+            session,
+            |_, _, event: &TerminalSessionEvent, cx| match event {
+                TerminalSessionEvent::OpenFile {
+                    path,
+                    line,
+                    column,
+                    window,
+                } => {
+                    let path = path.clone();
+                    let (line, column, window) = (*line, *column, *window);
+                    let weak = cx.weak_entity();
+                    cx.defer(move |cx| {
+                        let _ = window.update(cx, |_, window, cx| {
+                            let _ = weak.update(cx, |view, cx| {
+                                view.open_file_at(path, line, column, window, cx)
+                            });
+                        });
+                    });
+                }
+                TerminalSessionEvent::AttentionChanged => {
+                    cx.emit(TerminalPanelEvent::ContentChanged);
+                    cx.notify();
+                }
+            },
+        )
+    }
+
     pub(crate) fn new(workspace: PathBuf, cx: &mut Context<Self>) -> Self {
         let size = TerminalSize::default();
         let session = cx.new(|cx| TerminalSession::new(workspace.clone(), size, cx));
         let subscription = cx.observe(&session, |_, _, cx| cx.notify());
+        let session_subscription = Self::subscribe_session(&session, cx);
         Self {
             workspace,
             tabs: vec![WorkspaceTab {
                 id: 1,
                 content: TabContent::Terminal(session),
                 _subscription: subscription,
+                _session_subscription: Some(session_subscription),
             }],
             active: 0,
             last_terminal_id: Some(1),
@@ -418,6 +519,7 @@ impl TerminalView {
             fallback_focus: cx.focus_handle(),
             close_pending: false,
             files_locked: false,
+            rename: None,
             tab_list_open: false,
             tab_list_focus: cx.focus_handle(),
             tab_list_bounds: None,
@@ -508,6 +610,33 @@ impl TerminalView {
         (terminals.count(), active)
     }
 
+    pub(crate) fn tab_titles_snapshot(&self, cx: &gpui::App) -> Vec<Option<String>> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| match &tab.content {
+                TabContent::Terminal(session) => Some(session.read(cx).custom_title.clone()),
+                TabContent::File { .. } | TabContent::Diff { .. } => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn restore_tab_titles(&mut self, titles: &[Option<String>], cx: &mut Context<Self>) {
+        let sessions = self
+            .tabs
+            .iter()
+            .filter_map(|tab| match &tab.content {
+                TabContent::Terminal(session) => Some(session.clone()),
+                TabContent::File { .. } | TabContent::Diff { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        for (session, title) in sessions.into_iter().zip(titles.iter()) {
+            if let Some(title) = title {
+                session.update(cx, |session, _| session.custom_title = Some(title.clone()));
+            }
+        }
+        cx.notify();
+    }
+
     pub(crate) fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self
             .tabs
@@ -551,6 +680,17 @@ impl TerminalView {
             }
         }
         (exited, failed)
+    }
+
+    /// Count of unfocused terminals waiting for attention (after ringing the bell).
+    pub(crate) fn attention_terminal_count(&self, cx: &gpui::App) -> usize {
+        self.tabs
+            .iter()
+            .filter(|tab| match &tab.content {
+                TabContent::Terminal(session) => session.read(cx).needs_attention,
+                TabContent::File { .. } | TabContent::Diff { .. } => false,
+            })
+            .count()
     }
 
     pub(crate) fn has_dirty_files(&self, cx: &gpui::App) -> bool {
@@ -684,6 +824,17 @@ impl TerminalView {
     }
 
     pub(crate) fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_file_at(path, None, None, window, cx);
+    }
+
+    pub(crate) fn open_file_at(
+        &mut self,
+        path: PathBuf,
+        line: Option<u32>,
+        column: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.files_locked {
             return;
         }
@@ -693,23 +844,32 @@ impl TerminalView {
             self.workspace.join(path)
         };
         let path = crate::services::paths::without_windows_verbatim_prefix(&path);
-        if let Some(id) = self
-            .tabs
-            .iter()
-            .find(|tab| match &tab.content {
-                TabContent::File { path: existing, .. } => same_file_path(existing, &path),
-                TabContent::Terminal(_) | TabContent::Diff { .. } => false,
-            })
-            .map(|tab| tab.id)
-        {
+        if let Some((id, editor)) = self.tabs.iter().find_map(|tab| match &tab.content {
+            TabContent::File {
+                path: existing,
+                tab: file_tab,
+            } if same_file_path(existing, &path) => Some((tab.id, file_tab.editor().cloned())),
+            _ => None,
+        }) {
             self.select_tab(id, window, cx);
+            if let (Some(line), Some(editor)) = (line, editor) {
+                editor.update(cx, |editor, cx| {
+                    editor.reveal_position(line, column, window, cx)
+                });
+            }
             return;
         }
         let project = self.workspace.clone();
         let tab = if crate::services::project_files::is_image_path(&path) {
             FileTab::Image(cx.new(|cx| ImageViewer::open(project, path.clone(), window, cx)))
         } else {
-            FileTab::Editor(cx.new(|cx| FileEditor::open(project, path.clone(), window, cx)))
+            let editor = cx.new(|cx| FileEditor::open(project, path.clone(), window, cx));
+            if let Some(line) = line {
+                editor.update(cx, |editor, cx| {
+                    editor.reveal_position(line, column, window, cx)
+                });
+            }
+            FileTab::Editor(editor)
         };
         self.push_file(path, tab, window, cx);
     }
@@ -779,6 +939,7 @@ impl TerminalView {
             id,
             content: TabContent::Diff { title, view },
             _subscription: subscription,
+            _session_subscription: None,
         });
         self.select_tab(id, window, cx);
     }
@@ -822,6 +983,7 @@ impl TerminalView {
             id,
             content: TabContent::File { path, tab },
             _subscription: subscription,
+            _session_subscription: None,
         });
         self.select_tab(id, window, cx);
     }
@@ -883,10 +1045,12 @@ impl TerminalView {
             .unwrap_or_default();
         let session = cx.new(|cx| TerminalSession::new(workspace, size, cx));
         let subscription = cx.observe(&session, |_, _, cx| cx.notify());
+        let session_subscription = Self::subscribe_session(&session, cx);
         self.tabs.push(WorkspaceTab {
             id,
             content: TabContent::Terminal(session),
             _subscription: subscription,
+            _session_subscription: Some(session_subscription),
         });
         Some(id)
     }
@@ -975,6 +1139,9 @@ impl TerminalView {
     }
 
     fn remove_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rename.as_ref().is_some_and(|rename| rename.id == id) {
+            self.rename = None;
+        }
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
             return;
         };
@@ -1009,6 +1176,236 @@ impl TerminalView {
                 .unwrap_or(0);
             self.cells[slot] = Some(active_id);
         }
+        self.sync_cells();
+        self.focus(window, cx);
+        cx.emit(TerminalPanelEvent::LayoutChanged);
+        cx.emit(TerminalPanelEvent::ContentChanged);
+        cx.notify();
+    }
+
+    fn begin_rename_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| matches!(tab.content, TabContent::Terminal(_)))
+            .enumerate()
+            .find_map(|(terminal_index, (_, tab))| {
+                if tab.id != id {
+                    return None;
+                }
+                let TabContent::Terminal(session) = &tab.content else {
+                    return None;
+                };
+                let session = session.read(cx);
+                let label = session.custom_title.clone().unwrap_or_else(|| {
+                    let title = session.engine.title().trim();
+                    terminal_tab_title(
+                        if title.is_empty() {
+                            &session.shell
+                        } else {
+                            title
+                        },
+                        terminal_index + 1,
+                    )
+                });
+                Some(label)
+            });
+        let Some(current) = current else {
+            return;
+        };
+        let input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("Tab name");
+            input.set_value(current, window, cx);
+            input.focus(window, cx);
+            input
+        });
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            |view, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => view.commit_rename_tab(window, cx),
+                InputEvent::Blur => view.cancel_rename_tab(window, cx),
+                _ => {}
+            },
+        );
+        self.rename = Some(TabRename {
+            id,
+            input,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn commit_rename_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rename) = self.rename.take() else {
+            return;
+        };
+        let raw = rename.input.read(cx).value().trim().to_owned();
+        let next = (!raw.is_empty() && !raw.chars().any(char::is_control))
+            .then(|| raw.chars().take(64).collect::<String>());
+        if let Some(tab) = self.tabs.iter().find(|tab| tab.id == rename.id)
+            && let TabContent::Terminal(session) = &tab.content
+        {
+            session.update(cx, |session, _| session.custom_title = next);
+            cx.emit(TerminalPanelEvent::LayoutChanged);
+        }
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    fn cancel_rename_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rename.take().is_some() {
+            self.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn request_restart_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_pending {
+            return;
+        }
+        let Some(session) = self.tabs.iter().find_map(|tab| match &tab.content {
+            TabContent::Terminal(session) if tab.id == id => Some(session.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let running = matches!(
+            session.read(cx).status,
+            TerminalStatus::Starting | TerminalStatus::Running
+        );
+        if !running {
+            session.update(cx, |session, cx| session.restart(cx));
+            self.select_tab(id, window, cx);
+            return;
+        }
+        self.close_pending = true;
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            "Restart this terminal?",
+            Some("The shell and any commands running in this terminal will stop."),
+            &["Cancel", "Restart terminal"],
+            cx,
+        );
+        let handle = window.window_handle();
+        cx.spawn(async move |view, cx| {
+            let restart = answer.await.ok() == Some(1);
+            let _ = handle.update(cx, |_, window, cx| {
+                let _ = view.update(cx, |view, cx| {
+                    view.close_pending = false;
+                    if restart {
+                        session.update(cx, |session, cx| session.restart(cx));
+                        view.select_tab(id, window, cx);
+                    } else {
+                        view.focus(window, cx);
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn close_other_tabs(&mut self, keep_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_pending || self.tabs.len() <= 1 {
+            return;
+        }
+        if !self.tabs.iter().any(|tab| tab.id == keep_id) {
+            return;
+        }
+        let dirty_id = self.tabs.iter().find_map(|tab| {
+            (tab.id != keep_id
+                && tab.content.editor().is_some_and(|editor| {
+                    editor.read(cx).is_dirty() || editor.read(cx).is_saving()
+                }))
+            .then_some(tab.id)
+        });
+        if let Some(dirty_id) = dirty_id {
+            self.select_tab(dirty_id, window, cx);
+            self.close_tab(dirty_id, window, cx);
+            return;
+        }
+        let running_count = self
+            .tabs
+            .iter()
+            .filter(|tab| {
+                tab.id != keep_id
+                    && matches!(
+                        &tab.content,
+                        TabContent::Terminal(session)
+                            if matches!(
+                                session.read(cx).status,
+                                TerminalStatus::Starting | TerminalStatus::Running
+                            )
+                    )
+            })
+            .count();
+        if running_count == 0 {
+            self.remove_other_tabs(keep_id, window, cx);
+            return;
+        }
+        let other_count = self.tabs.len() - 1;
+        self.close_pending = true;
+        let title = format!(
+            "Close {other_count} other tab{}?",
+            if other_count == 1 { "" } else { "s" }
+        );
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            &title,
+            Some("Running shells and commands in those tabs will stop."),
+            &["Cancel", "Close other tabs"],
+            cx,
+        );
+        let handle = window.window_handle();
+        cx.spawn(async move |view, cx| {
+            let close = answer.await.ok() == Some(1);
+            let _ = handle.update(cx, |_, window, cx| {
+                let _ = view.update(cx, |view, cx| {
+                    view.close_pending = false;
+                    if close {
+                        view.remove_other_tabs(keep_id, window, cx);
+                    } else {
+                        view.focus(window, cx);
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn remove_other_tabs(&mut self, keep_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .rename
+            .as_ref()
+            .is_some_and(|rename| rename.id != keep_id)
+        {
+            self.rename = None;
+        }
+        self.tabs.retain(|tab| {
+            tab.id == keep_id
+                || tab
+                    .content
+                    .editor()
+                    .is_some_and(|editor| editor.read(cx).is_dirty() || editor.read(cx).is_saving())
+        });
+        self.active = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == keep_id)
+            .unwrap_or(0);
+        self.last_terminal_id = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == keep_id && matches!(tab.content, TabContent::Terminal(_)))
+            .or_else(|| {
+                self.tabs
+                    .iter()
+                    .find(|tab| matches!(tab.content, TabContent::Terminal(_)))
+            })
+            .map(|tab| tab.id);
         self.sync_cells();
         self.focus(window, cx);
         cx.emit(TerminalPanelEvent::LayoutChanged);
@@ -1203,7 +1600,11 @@ impl Render for TerminalSession {
                     .overflow_hidden()
                     .p(px(chrome::INSET))
                     .bg(theme::canvas())
-                    .cursor(CursorStyle::IBeam)
+                    .cursor(if self.ctrl_held && self.hovered_link.is_some() {
+                        CursorStyle::PointingHand
+                    } else {
+                        CursorStyle::IBeam
+                    })
                     .font_family(font_family)
                     .text_size(theme::text_size(font_size))
                     .line_height(px(row_height))
@@ -1211,6 +1612,7 @@ impl Render for TerminalSession {
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
                     .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_down))
+                    .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
                     .on_key_down(cx.listener(Self::on_key_down))
                     .on_scroll_wheel(cx.listener(Self::on_scroll))
                     .child(TerminalElement {
@@ -1441,6 +1843,7 @@ impl TerminalView {
                             }),
                     )
                     .child(div().flex_1().min_w_0().truncate().child(entry.label))
+                    .when(entry.attention, |row| row.child(attention_mark()))
                     .when(current, |row| row.child(check_mark()))
                     .child(
                         div()
@@ -1477,6 +1880,13 @@ impl TerminalView {
 }
 
 #[derive(Clone)]
+enum TabMenuKind {
+    Terminal,
+    File(PathBuf),
+    Diff,
+}
+
+#[derive(Clone)]
 struct TabEntry {
     id: u64,
     label: String,
@@ -1485,6 +1895,9 @@ struct TabEntry {
     status: Option<(String, gpui::Rgba)>,
     /// On screen in one of several grid panes.
     shown: bool,
+    /// Unfocused terminal rang the bell.
+    attention: bool,
+    kind: TabMenuKind,
 }
 
 impl EventEmitter<TerminalPanelEvent> for TerminalView {}
@@ -1508,19 +1921,21 @@ impl Render for TerminalView {
             .tabs
             .iter()
             .map(|tab| {
-                let (label, tooltip, icon, status) = match &tab.content {
+                let (label, tooltip, icon, status, attention, kind) = match &tab.content {
                     TabContent::Terminal(session) => {
                         terminal_index += 1;
                         let session = session.read(cx);
                         let title = session.engine.title().trim();
-                        let label = terminal_tab_title(
-                            if title.is_empty() {
-                                &session.shell
-                            } else {
-                                title
-                            },
-                            terminal_index,
-                        );
+                        let label = session.custom_title.clone().unwrap_or_else(|| {
+                            terminal_tab_title(
+                                if title.is_empty() {
+                                    &session.shell
+                                } else {
+                                    title
+                                },
+                                terminal_index,
+                            )
+                        });
                         let status_color = match session.status {
                             TerminalStatus::Starting => theme::working(),
                             TerminalStatus::Failed(_) => theme::error(),
@@ -1528,11 +1943,18 @@ impl Render for TerminalView {
                             | TerminalStatus::Running
                             | TerminalStatus::Exited(_) => theme::ash(),
                         };
-                        let tooltip = format!(
+                        let mut tooltip = format!(
                             "{} · {}",
-                            if title.is_empty() { &label } else { title },
+                            if session.custom_title.is_some() || title.is_empty() {
+                                &label
+                            } else {
+                                title
+                            },
                             session.status.label()
                         );
+                        if session.needs_attention {
+                            tooltip.push_str(" · Needs attention");
+                        }
                         (
                             label,
                             tooltip,
@@ -1542,6 +1964,8 @@ impl Render for TerminalView {
                                 TerminalStatus::Failed(_) | TerminalStatus::Exited(_)
                             )
                             .then(|| (session.status.label(), status_color)),
+                            session.needs_attention,
+                            TabMenuKind::Terminal,
                         )
                     }
                     TabContent::File { path, tab } => {
@@ -1555,6 +1979,8 @@ impl Render for TerminalView {
                             path.to_string_lossy().into_owned(),
                             icon,
                             tab.is_dirty(cx).then(|| ("●".to_owned(), theme::ash())),
+                            false,
+                            TabMenuKind::File(path.clone()),
                         )
                     }
                     TabContent::Diff { title, .. } => (
@@ -1562,6 +1988,8 @@ impl Render for TerminalView {
                         format!("{title} · Read-only diff"),
                         "icons/diff.svg",
                         None,
+                        false,
+                        TabMenuKind::Diff,
                     ),
                 };
                 TabEntry {
@@ -1571,14 +1999,29 @@ impl Render for TerminalView {
                     icon,
                     status,
                     shown: !self.grid.is_single() && self.is_shown(tab.id),
+                    attention,
+                    kind,
                 }
             })
             .collect::<Vec<_>>();
+        let can_close_others = self.tabs.len() > 1;
         let tabs = entries
             .iter()
             .enumerate()
             .map(|(index, entry)| {
-                workspace_tab(entry.clone(), index == self.active, cx).into_any_element()
+                let rename_input = self
+                    .rename
+                    .as_ref()
+                    .filter(|rename| rename.id == entry.id)
+                    .map(|rename| rename.input.clone());
+                workspace_tab(
+                    entry.clone(),
+                    index == self.active,
+                    can_close_others,
+                    rename_input,
+                    cx,
+                )
+                .into_any_element()
             })
             .collect::<Vec<_>>();
         let panes =
@@ -1709,6 +2152,7 @@ fn terminal_tab_title(title: &str, index: usize) -> String {
     let shell = match basename.to_ascii_lowercase().as_str() {
         "cmd" | "cmd.exe" => Some("CMD"),
         "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe" => Some("PowerShell"),
+        "bash" | "bash.exe" => Some("Bash"),
         _ => None,
     };
     if let Some(shell) = shell {
@@ -1734,6 +2178,8 @@ fn terminal_tab_title(title: &str, index: usize) -> String {
 fn workspace_tab(
     entry: TabEntry,
     selected: bool,
+    can_close_others: bool,
+    rename_input: Option<Entity<InputState>>,
     cx: &mut Context<TerminalView>,
 ) -> impl IntoElement {
     let TabEntry {
@@ -1743,12 +2189,17 @@ fn workspace_tab(
         icon,
         status,
         shown,
+        attention,
+        kind,
     } = entry;
     let select_id = id;
     let close_id = id;
+    let is_terminal = matches!(kind, TabMenuKind::Terminal);
     let dirty = status.as_ref().is_some_and(|(label, _)| label == "●");
     let drag = grid::PaneDrag::new(id, &label, icon);
-    div()
+    let owner = cx.weak_entity();
+    let menu_kind = kind;
+    let tab = div()
         .id(SharedString::from(format!("terminal-tab-{id}")))
         .group("workspace-tab")
         .debug_selector(move || format!("terminal-tab-{id}"))
@@ -1800,8 +2251,26 @@ fn workspace_tab(
         } else {
             tooltip
         }))
-        .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
-        .on_click(cx.listener(move |view, _, window, cx| view.select_tab(select_id, window, cx)))
+        .when(rename_input.is_none(), |tab| {
+            tab.on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
+        })
+        .on_mouse_down(
+            MouseButton::Middle,
+            cx.listener(move |view, _, window, cx| {
+                cx.stop_propagation();
+                view.close_tab(close_id, window, cx);
+            }),
+        )
+        .on_click(
+            cx.listener(move |view, event: &gpui::ClickEvent, window, cx| {
+                if is_terminal && event.click_count() == 2 {
+                    view.select_tab(select_id, window, cx);
+                    view.begin_rename_tab(select_id, window, cx);
+                } else {
+                    view.select_tab(select_id, window, cx);
+                }
+            }),
+        )
         .child(
             svg()
                 .path(icon)
@@ -1816,8 +2285,25 @@ fn workspace_tab(
                     icon.group_hover("workspace-tab", |style| style.text_color(theme::bone()))
                 }),
         )
-        .child(
-            div()
+        .child(match rename_input {
+            Some(input) => div()
+                .min_w(px(72.0))
+                .flex_1()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        view.cancel_rename_tab(window, cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .child(
+                    Input::new(&input)
+                        .h(px(24.0))
+                        .font_family(chrome::CHROME_FONT)
+                        .text_size(px(12.0)),
+                )
+                .into_any_element(),
+            None => div()
                 .min_w_0()
                 .flex_1()
                 .overflow_hidden()
@@ -1826,8 +2312,10 @@ fn workspace_tab(
                 .font_family(chrome::CHROME_FONT)
                 .text_size(px(12.0))
                 .font_weight(FontWeight::NORMAL)
-                .child(label),
-        )
+                .child(label)
+                .into_any_element(),
+        })
+        .when(attention, |tab| tab.child(attention_mark()))
         .when_some(
             status.filter(|(label, _)| label != "●"),
             |tab, (status, color)| {
@@ -1897,7 +2385,86 @@ fn workspace_tab(
                         .text_color(theme::ash())
                         .into_any_element()
                 }),
-        )
+        );
+    div()
+        .id(SharedString::from(format!("workspace-tab-wrap-{id}")))
+        .h_full()
+        .flex()
+        .flex_shrink_0()
+        .child(tab.context_menu(move |menu, _, _| {
+            tab_context_menu(menu, owner.clone(), id, menu_kind.clone(), can_close_others)
+        }))
+}
+
+fn tab_context_menu(
+    mut menu: PopupMenu,
+    owner: gpui::WeakEntity<TerminalView>,
+    id: u64,
+    kind: TabMenuKind,
+    can_close_others: bool,
+) -> PopupMenu {
+    match kind {
+        TabMenuKind::Terminal => {
+            let rename_owner = owner.clone();
+            let restart_owner = owner.clone();
+            menu = menu
+                .item(
+                    PopupMenuItem::new("Rename tab…").on_click(move |_, window, cx| {
+                        let owner = rename_owner.clone();
+                        window.defer(cx, move |window, cx| {
+                            let _ = owner.update(cx, |view, cx| {
+                                view.select_tab(id, window, cx);
+                                view.begin_rename_tab(id, window, cx);
+                            });
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new("Restart terminal").on_click(move |_, window, cx| {
+                        let owner = restart_owner.clone();
+                        window.defer(cx, move |window, cx| {
+                            let _ = owner
+                                .update(cx, |view, cx| view.request_restart_tab(id, window, cx));
+                        });
+                    }),
+                )
+                .separator();
+        }
+        TabMenuKind::File(path) => {
+            let reveal_path = path.clone();
+            menu = menu
+                .item(
+                    PopupMenuItem::new("Reveal in File Explorer")
+                        .on_click(move |_, _, cx| cx.reveal_path(&reveal_path)),
+                )
+                .item(PopupMenuItem::new("Copy path").on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(
+                        path.to_string_lossy().into_owned(),
+                    ))
+                }))
+                .separator();
+        }
+        TabMenuKind::Diff => {}
+    }
+    let close_owner = owner.clone();
+    menu.item(
+        PopupMenuItem::new("Close tab").on_click(move |_, window, cx| {
+            let owner = close_owner.clone();
+            window.defer(cx, move |window, cx| {
+                let _ = owner.update(cx, |view, cx| view.close_tab(id, window, cx));
+            });
+        }),
+    )
+    .item(
+        PopupMenuItem::new("Close other tabs")
+            .disabled(!can_close_others)
+            .on_click(move |_, window, cx| {
+                let owner = owner.clone();
+                window.defer(cx, move |window, cx| {
+                    let _ = owner.update(cx, |view, cx| view.close_other_tabs(id, window, cx));
+                });
+            }),
+    )
 }
 
 #[cfg(test)]
@@ -2421,6 +2988,7 @@ mod tests {
         cx.run_until_parked();
         let tab = cx.debug_bounds("terminal-tab-1").unwrap();
         let add = cx.debug_bounds("new-terminal").unwrap();
+        assert_eq!(tab.size.height, px(chrome::HEADER_HEIGHT - 1.0));
         assert!(tab.size.width >= px(chrome::TAB_MIN_WIDTH));
         assert!(tab.size.width < px(180.0));
         assert!(add.left() >= tab.right());
@@ -2442,5 +3010,71 @@ mod tests {
             }
             assert_eq!(view.stopped_terminal_counts(cx), (1, 1));
         });
+    }
+
+    #[gpui::test]
+    fn background_bell_sets_attention_until_focused_and_tab_rename_and_close_others_work(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(FileEditor::initialize);
+        let pane = cx.new(|cx| TerminalView::new(PathBuf::from("synthetic-project"), cx));
+        let root_pane = pane.clone();
+        let window =
+            cx.add_window(move |window, cx| gpui_component::Root::new(root_pane, window, cx));
+        window
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |view, cx| {
+                    view.restore_layout(3, 0, cx);
+                    assert_eq!(view.terminal_count(), 3);
+                    let TabContent::Terminal(second) = &view.tabs[1].content else {
+                        panic!("second terminal");
+                    };
+                    let second = second.clone();
+                    // Unfocused bell sets attention.
+                    second.update(cx, |session, cx| {
+                        session.is_focused = false;
+                        session.apply_events(vec![TerminalEvent::Output(b"done\x07".to_vec())], cx);
+                    });
+                    assert_eq!(view.attention_terminal_count(cx), 1);
+
+                    // Rename second terminal tab and snapshot its title.
+                    let second_id = view.tabs[1].id;
+                    view.begin_rename_tab(second_id, window, cx);
+                    if let Some(rename) = &view.rename {
+                        rename
+                            .input
+                            .update(cx, |input, cx| input.set_value("tests", window, cx));
+                    }
+                    view.commit_rename_tab(window, cx);
+                    assert_eq!(
+                        view.tab_titles_snapshot(cx),
+                        vec![None, Some("tests".into()), None]
+                    );
+
+                    // A running/starting tab requires confirmation before closing other tabs.
+                    view.close_other_tabs(second_id, window, cx);
+                    assert!(view.close_pending);
+                    assert_eq!(view.tabs.len(), 3);
+                    view.close_pending = false;
+
+                    // Once other tabs are exited/dormant, close_other_tabs removes them directly.
+                    for tab in &view.tabs {
+                        if tab.id != second_id
+                            && let TabContent::Terminal(session) = &tab.content
+                        {
+                            session.update(cx, |session, _| {
+                                session.status = TerminalStatus::Exited(0);
+                            });
+                        }
+                    }
+                    view.close_other_tabs(second_id, window, cx);
+                    assert!(!view.close_pending);
+                    assert_eq!(view.tabs.len(), 1);
+                    assert_eq!(view.tabs[0].id, second_id);
+                    assert_eq!(view.tab_titles_snapshot(cx), vec![Some("tests".into())]);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
     }
 }

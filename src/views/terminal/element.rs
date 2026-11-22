@@ -157,6 +157,10 @@ impl Element for TerminalElement {
         };
         let focused = session.focus_handle.is_focused(window);
         let cursor_visible = !snapshot.cursor_blinking || session.cursor_visible;
+        let hovered_link = session
+            .ctrl_held
+            .then_some(session.hovered_link.as_ref())
+            .flatten();
         let mut cells = Vec::new();
         for (row, line) in snapshot.rows.iter().enumerate() {
             if cell_height * row >= bounds.size.height {
@@ -170,7 +174,12 @@ impl Element for TerminalElement {
                     bounds.left() + cell_width * col,
                     bounds.top() + cell_height * row,
                 );
+                let link_hover =
+                    hovered_link.is_some_and(|link| link.row == row && link.cols.contains(&col));
                 let (mut foreground, mut background) = cell_colors(cell);
+                if link_hover && !cell.selected {
+                    foreground = theme::focus();
+                }
                 let at_cursor = snapshot.cursor == Some((row, col))
                     || (cell.wide_spacer && col > 0 && snapshot.cursor == Some((row, col - 1)));
                 let block_cursor = focused
@@ -183,11 +192,14 @@ impl Element for TerminalElement {
                 }
                 let cell_bounds = Bounds::new(origin, size(cell_width, cell_height));
                 let shaped = if cell.wide_spacer
-                    || (cell.text.trim().is_empty() && !cell.underline && !cell.strikethrough)
+                    || (cell.text.trim().is_empty()
+                        && !cell.underline
+                        && !cell.strikethrough
+                        && !link_hover)
                 {
                     None
                 } else {
-                    let style = styled_cell(cell, &default_style, foreground);
+                    let style = styled_cell(cell, &default_style, foreground, link_hover);
                     let line = window.text_system().shape_line(
                         cell.text.clone().into(),
                         font_size,
@@ -364,14 +376,19 @@ fn styled_cell(
     cell: &TerminalCell,
     default_style: &TextStyle,
     foreground: gpui::Rgba,
+    link_hover: bool,
 ) -> TextStyle {
     default_style.clone().highlight(HighlightStyle {
         color: Some(foreground.into()),
         font_weight: cell.bold.then_some(FontWeight::BOLD),
         font_style: cell.italic.then_some(FontStyle::Italic),
-        underline: cell.underline.then_some(UnderlineStyle {
+        underline: (cell.underline || link_hover).then_some(UnderlineStyle {
             thickness: px(1.0),
-            color: Some(foreground.into()),
+            color: Some(if link_hover {
+                theme::focus().into()
+            } else {
+                foreground.into()
+            }),
             ..Default::default()
         }),
         strikethrough: cell.strikethrough.then_some(StrikethroughStyle {

@@ -474,6 +474,13 @@ impl TerminalView {
             .when_some(entry, |header, entry| {
                 let close_id = entry.id;
                 header
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |view, _, window, cx| {
+                            cx.stop_propagation();
+                            view.close_tab(close_id, window, cx);
+                        }),
+                    )
                     .child(
                         svg()
                             .path(entry.icon)
@@ -492,6 +499,9 @@ impl TerminalView {
                             .truncate()
                             .child(entry.label.clone()),
                     )
+                    .when(entry.attention, |header| {
+                        header.child(crate::views::terminal_manager::attention_mark())
+                    })
                     .when_some(entry.status.clone(), |header, (status, color)| {
                         header.child(
                             div()

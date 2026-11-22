@@ -12,4 +12,7 @@ pub mod terminal;
 pub(crate) mod terminal_engine;
 pub(crate) mod terminal_font;
 pub(crate) mod terminal_grid;
+pub(crate) mod terminal_links;
+pub(crate) mod terminal_shell;
 pub(crate) mod terminal_workspace;
+pub(crate) mod window_state;

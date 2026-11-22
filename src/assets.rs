@@ -5,7 +5,11 @@ use std::sync::LazyLock;
 
 use gpui::{AssetSource, Result, SharedString};
 
-const ICONS: [(&str, &[u8]); 51] = [
+const ICONS: [(&str, &[u8]); 52] = [
+    (
+        "arrow-down.svg",
+        include_bytes!("../assets/icons/arrow-down.svg"),
+    ),
     (
         "folder-open.svg",
         include_bytes!("../assets/icons/folder-open.svg"),

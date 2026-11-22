@@ -14,6 +14,8 @@ pub(crate) struct TerminalProject {
     pub(crate) path: PathBuf,
     pub(crate) tab_count: usize,
     pub(crate) active_tab: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tab_titles: Vec<Option<String>>,
     #[serde(default)]
     pub(crate) checklist: super::checklist::Checklist,
     #[serde(default)]
@@ -26,6 +28,7 @@ impl TerminalProject {
             path: super::paths::without_windows_verbatim_prefix(&path),
             tab_count: 1,
             active_tab: 0,
+            tab_titles: Vec::new(),
             checklist: super::checklist::Checklist::default(),
             grid: super::terminal_grid::TerminalGrid::default(),
         }
@@ -35,6 +38,26 @@ impl TerminalProject {
     pub(crate) fn update_layout(&mut self, count: usize, active: usize) {
         self.tab_count = count.clamp(1, MAX_TERMINAL_TABS);
         self.active_tab = active.min(self.tab_count - 1);
+        self.normalize_tab_titles();
+    }
+
+    pub(crate) fn update_tab_titles(&mut self, titles: Vec<Option<String>>) {
+        self.tab_titles = titles;
+        self.normalize_tab_titles();
+    }
+
+    fn normalize_tab_titles(&mut self) {
+        self.tab_titles.truncate(self.tab_count);
+        for title in &mut self.tab_titles {
+            *title = title
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+                .map(|value| value.chars().take(64).collect());
+        }
+        if self.tab_titles.iter().all(Option::is_none) {
+            self.tab_titles.clear();
+        }
     }
 }
 
@@ -267,6 +290,7 @@ mod tests {
             ),
             tab_count: 3,
             active_tab: 2,
+            tab_titles: vec![Some("server".into()), None, Some("tests".into())],
             checklist: checklist::Checklist::default(),
             grid: TerminalGrid::new(2, 2),
         });
@@ -336,6 +360,7 @@ mod tests {
                     path: "one".into(),
                     tab_count: 0,
                     active_tab: 90,
+                    tab_titles: vec![Some("   ".into()), Some("extra".into())],
                     checklist: checklist::Checklist::default(),
                     grid: TerminalGrid::default(),
                 },
@@ -343,6 +368,7 @@ mod tests {
                     path: "one".into(),
                     tab_count: 2,
                     active_tab: 1,
+                    tab_titles: Vec::new(),
                     checklist: checklist::Checklist::default(),
                     grid: TerminalGrid::default(),
                 },
@@ -350,6 +376,7 @@ mod tests {
                     path: "two".into(),
                     tab_count: 90,
                     active_tab: 90,
+                    tab_titles: Vec::new(),
                     checklist: checklist::Checklist::default(),
                     grid: TerminalGrid::default(),
                 },

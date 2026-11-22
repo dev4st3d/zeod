@@ -1,13 +1,17 @@
 use gpui::{
-    App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size,
+    App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*, px,
+    size,
 };
 
 use crate::assets::Assets;
 use crate::fonts;
+use crate::services::window_state::{self, Rect, WindowMode};
 use crate::views::terminal_manager::TerminalManager;
 
 pub fn run() {
-    let working_directory = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let (working_directory, requested_project) =
+        window_state::resolve_launch_directory(std::env::args_os().skip(1), &cwd);
     Application::new()
         .with_assets(Assets)
         .run(move |cx: &mut App| {
@@ -18,17 +22,50 @@ pub fn run() {
             let storage_path = font_catalog
                 .settings_path
                 .with_file_name("terminal-workspace.json");
-            // Leave room for the taskbar and resize borders on smaller displays.
-            let initial_size =
-                cx.primary_display()
-                    .map_or(size(px(1440.0), px(900.0)), |display| {
-                        let available = display.bounds().size;
-                        size(
-                            px(1440.0_f32.min((f32::from(available.width) - 48.0).max(640.0))),
-                            px(900.0_f32.min((f32::from(available.height) - 80.0).max(480.0))),
-                        )
-                    });
-            let bounds = Bounds::centered(None, initial_size, cx);
+            let window_state_path = storage_path.with_file_name("window-state.json");
+            let saved_window = window_state::load(&window_state_path).ok().flatten();
+            let displays: Vec<Rect> = cx
+                .displays()
+                .into_iter()
+                .map(|display| {
+                    let bounds = display.bounds();
+                    Rect::new(
+                        f32::from(bounds.origin.x),
+                        f32::from(bounds.origin.y),
+                        f32::from(bounds.size.width),
+                        f32::from(bounds.size.height),
+                    )
+                })
+                .collect();
+            let primary = cx
+                .primary_display()
+                .map(|display| {
+                    let bounds = display.bounds();
+                    Rect::new(
+                        f32::from(bounds.origin.x),
+                        f32::from(bounds.origin.y),
+                        f32::from(bounds.size.width),
+                        f32::from(bounds.size.height),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    Rect::new(
+                        0.0,
+                        0.0,
+                        window_state::DEFAULT_WINDOW_WIDTH,
+                        window_state::DEFAULT_WINDOW_HEIGHT,
+                    )
+                });
+            let (rect, mode) =
+                window_state::resolve_window_bounds(saved_window, &displays, primary);
+            let bounds = Bounds::new(
+                point(px(rect.x), px(rect.y)),
+                size(px(rect.width), px(rect.height)),
+            );
+            let window_bounds = match mode {
+                WindowMode::Windowed => WindowBounds::Windowed(bounds),
+                WindowMode::Maximized => WindowBounds::Maximized(bounds),
+            };
             cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {
                     cx.quit();
@@ -37,8 +74,11 @@ pub fn run() {
             .detach();
             let opened = cx.open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(size(px(800.0), px(540.0))),
+                    window_bounds: Some(window_bounds),
+                    window_min_size: Some(size(
+                        px(window_state::MIN_WINDOW_WIDTH),
+                        px(window_state::MIN_WINDOW_HEIGHT),
+                    )),
                     titlebar: Some(TitlebarOptions {
                         title: Some("Zeod — Terminals".into()),
                         appears_transparent: true,
@@ -51,6 +91,7 @@ pub fn run() {
                     let root = cx.new(|cx| {
                         TerminalManager::new(
                             working_directory.clone(),
+                            requested_project.clone(),
                             storage_path.clone(),
                             window,
                             cx,

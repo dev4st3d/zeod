@@ -442,6 +442,98 @@ pub(crate) fn fetch(repository: &Repository, remote: &str) -> Result<(), String>
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PullPlan {
+    pub(crate) repository: Repository,
+    pub(crate) remote: String,
+    pub(crate) label: String,
+}
+
+pub(crate) fn pull_plan(repository: &Repository) -> Result<PullPlan, String> {
+    if repository.branch.is_none() {
+        return Err("Switch to a branch before pulling.".into());
+    }
+    let upstream = repository
+        .upstream
+        .as_ref()
+        .ok_or("This branch has no upstream to pull from.")?;
+    if !repository.remotes.contains(&upstream.remote) {
+        return Err(
+            "The upstream remote is unavailable. Check your Git remote configuration.".into(),
+        );
+    }
+    Ok(PullPlan {
+        repository: repository.clone(),
+        remote: upstream.remote.clone(),
+        label: upstream.label.clone(),
+    })
+}
+
+/// Explicit, fast-forward-only pull. Diverged histories or conflicting local edits fail
+/// cleanly without creating merge commits or auto-stashing.
+pub(crate) fn pull(plan: &PullPlan) -> Result<String, String> {
+    let expected = &plan.repository;
+    let current = repository(&expected.root)?;
+    if current.head != expected.head
+        || current.branch != expected.branch
+        || current.upstream != expected.upstream
+    {
+        return Err(
+            "The branch changed. Refresh and review incoming commits before pulling.".into(),
+        );
+    }
+    if !current.remotes.contains(&plan.remote) {
+        return Err("The upstream remote is no longer available. Refresh and retry.".into());
+    }
+    let output = run_git_with_input(
+        &current.root,
+        &args(&[
+            "pull",
+            "--ff-only",
+            "--no-rebase",
+            "--no-recurse-submodules",
+            "--no-autostash",
+            "--",
+            &plan.remote,
+        ]),
+        None,
+        WRITE_TIMEOUT,
+    )
+    .map_err(|error| error.to_string())?;
+    if output.success && !output.truncated {
+        let updated = optional_head(&current.root)?;
+        if updated == expected.head {
+            return Ok("Already up to date.".into());
+        }
+        return Ok(format!("Pulled from {}.", plan.label));
+    }
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    if diagnostic.contains("index.lock") {
+        return Err(
+            "Another Git operation is using this repository. Wait for it to finish, then retry."
+                .into(),
+        );
+    }
+    if diagnostic.contains("Not possible to fast-forward")
+        || diagnostic.contains("diverging branches")
+    {
+        return Err(
+            "Cannot fast-forward: local and remote branches have diverged. Merge or rebase in a terminal."
+                .into(),
+        );
+    }
+    if diagnostic.contains("overwritten by merge")
+        || diagnostic.contains("uncommitted changes")
+        || diagnostic.contains("Please commit your changes")
+    {
+        return Err(
+            "Local changes would be overwritten by pull. Commit or discard them first, then retry."
+                .into(),
+        );
+    }
+    Err("Pull did not finish. Check authentication or your connection, then retry.".into())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct FileStamp {
     index: Vec<u8>,
     contents: Option<String>,

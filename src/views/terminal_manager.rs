@@ -9,8 +9,8 @@ use std::path::PathBuf;
 
 use gpui::{
     App, Bounds, Context, Entity, FocusHandle, FontWeight, IntoElement, KeyDownEvent,
-    PathPromptOptions, Pixels, PromptLevel, Render, ScrollHandle, SharedString, Subscription,
-    Window, WindowControlArea, actions, anchored, deferred, div, prelude::*, px, svg,
+    PathPromptOptions, Pixels, PromptLevel, Render, ScrollHandle, SharedString, Subscription, Task,
+    Window, WindowBounds, WindowControlArea, actions, anchored, deferred, div, prelude::*, px, svg,
 };
 
 use super::checklist::ChecklistView;
@@ -23,7 +23,9 @@ use crate::services::{
     app_update::{self, CheckOutcome, PrepareOutcome, ScheduleOutcome},
     keymap::{self, Keymap, Shortcut, ShortcutGroup},
     terminal_font::{self, TerminalFont},
+    terminal_shell::{self, TerminalShell},
     terminal_workspace::TerminalWorkspace,
+    window_state::{self, SavedWindow, WindowMode},
 };
 use crate::theme;
 use crate::theme::terminal_manager as chrome;
@@ -34,6 +36,7 @@ const APPEARANCE_LOAD_ERROR: &str =
     "The saved theme could not be read. Choose a theme to save a new preference.";
 const FONT_LOAD_ERROR: &str =
     "The saved terminal font could not be read. Choose a font to save a new preference.";
+const SHELL_LOAD_ERROR: &str = "The saved terminal shell could not be read. Choose a shell in Settings to save a new preference.";
 const KEYMAP_LOAD_ERROR: &str =
     "The saved shortcuts could not be read. Change a shortcut to save a new set.";
 const PREFERENCES_SAVE_ERROR: &str =
@@ -83,12 +86,14 @@ enum UpdateState {
     Error(String),
 }
 
-/// Revisions of the terminal font and shortcut preferences. A file is written
+/// Revisions of the terminal font, shell, and shortcut preferences. A file is written
 /// when its revision is ahead of the last revision known to be on disk.
 #[derive(Default)]
 struct PreferenceSaves {
     font_revision: u64,
     font_saved: u64,
+    shell_revision: u64,
+    shell_saved: u64,
     keymap_revision: u64,
     keymap_saved: u64,
     saving: bool,
@@ -142,6 +147,8 @@ pub(crate) struct TerminalManager {
     update_generation: u64,
     update_restart_pending: bool,
     update_scheduling: bool,
+    window_bounds: Option<SavedWindow>,
+    _window_save_task: Option<Task<()>>,
     _bounds_subscription: Subscription,
 }
 
@@ -155,6 +162,7 @@ impl TerminalManager {
 
     pub(crate) fn new(
         initial: PathBuf,
+        requested_project: Option<PathBuf>,
         storage_path: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -162,17 +170,19 @@ impl TerminalManager {
         let load_path = storage_path.clone();
         let appearance_path = storage_path.with_file_name("appearance.json");
         let font_path = storage_path.with_file_name("terminal-font.json");
+        let shell_path = storage_path.with_file_name("terminal-shell.json");
         let keymap_path = storage_path.with_file_name("keybindings.json");
         let load = cx.background_executor().spawn(async move {
             (
                 TerminalWorkspace::load(&load_path, &initial),
                 crate::services::appearance::load(&appearance_path),
                 terminal_font::load(&font_path),
+                terminal_shell::load(&shell_path),
                 keymap::load(&keymap_path),
             )
         });
         cx.spawn_in(window, async move |view, cx| {
-            let ((workspace, warning), appearance, font, keymap) = load.await;
+            let ((mut workspace, warning), appearance, font, shell, keymap) = load.await;
             let _ = cx.update(|window, cx| {
                 let _ = view.update(cx, |view, cx| {
                     if view.appearance_revision == 0 {
@@ -197,6 +207,15 @@ impl TerminalManager {
                             }
                         }
                     }
+                    if view.preferences.shell_revision == 0 {
+                        match shell {
+                            Ok(shell) => view.install_shell(shell, cx),
+                            Err(error) => {
+                                eprintln!("Terminal shell preference could not be read: {error}");
+                                view.add_notice(SHELL_LOAD_ERROR);
+                            }
+                        }
+                    }
                     if view.preferences.keymap_revision == 0 {
                         match keymap {
                             Ok(keymap) => view.apply_keymap(keymap, cx),
@@ -205,6 +224,9 @@ impl TerminalManager {
                                 view.add_notice(KEYMAP_LOAD_ERROR);
                             }
                         }
+                    }
+                    if let Some(dir) = requested_project {
+                        workspace.insert_project(dir);
                     }
                     view.restore_warning = warning;
                     view.workspace = Some(workspace);
@@ -217,6 +239,7 @@ impl TerminalManager {
         .detach();
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
+        let initial_bounds = Self::capture_window_bounds(window, None);
         let mut manager = Self {
             workspace: None,
             projects: Vec::new(),
@@ -254,6 +277,8 @@ impl TerminalManager {
             update_generation: 0,
             update_restart_pending: false,
             update_scheduling: false,
+            window_bounds: initial_bounds,
+            _window_save_task: None,
             _bounds_subscription: cx
                 .observe_window_bounds(window, |view, window, cx| view.resize(window, cx)),
         };
@@ -588,6 +613,24 @@ impl TerminalManager {
         }
     }
 
+    /// Use a saved shell, falling back to the system default if its executable was removed.
+    fn install_shell(&mut self, shell: TerminalShell, cx: &mut Context<Self>) {
+        let shell = if terminal_shell::is_available(&shell) {
+            shell
+        } else {
+            self.add_notice(&format!(
+                "The saved shell “{}” is no longer installed, so new terminals use the system default.",
+                shell.label()
+            ));
+            TerminalShell::default()
+        };
+        self.apply_shell(shell, cx);
+    }
+
+    fn apply_shell(&mut self, shell: TerminalShell, cx: &mut Context<Self>) {
+        cx.set_global(shell);
+    }
+
     fn apply_keymap(&mut self, keymap: Keymap, cx: &mut Context<Self>) {
         let previous = Keymap::global(cx).clone();
         let current = keymap.clone();
@@ -598,6 +641,13 @@ impl TerminalManager {
     fn set_font(&mut self, font: TerminalFont, window: &mut Window, cx: &mut Context<Self>) {
         self.preferences.font_revision = self.preferences.font_revision.wrapping_add(1);
         self.apply_font(font, cx);
+        self.save_preferences(window, cx);
+        cx.notify();
+    }
+
+    fn set_shell(&mut self, shell: TerminalShell, window: &mut Window, cx: &mut Context<Self>) {
+        self.preferences.shell_revision = self.preferences.shell_revision.wrapping_add(1);
+        self.apply_shell(shell, cx);
         self.save_preferences(window, cx);
         cx.notify();
     }
@@ -614,24 +664,32 @@ impl TerminalManager {
     fn save_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let saves = &mut self.preferences;
         let font_dirty = saves.font_revision != saves.font_saved;
+        let shell_dirty = saves.shell_revision != saves.shell_saved;
         let keymap_dirty = saves.keymap_revision != saves.keymap_saved;
-        if saves.saving || !(font_dirty || keymap_dirty) {
+        if saves.saving || !(font_dirty || shell_dirty || keymap_dirty) {
             return;
         }
         saves.saving = true;
-        let (font_revision, keymap_revision) = (saves.font_revision, saves.keymap_revision);
+        let (font_revision, shell_revision, keymap_revision) = (
+            saves.font_revision,
+            saves.shell_revision,
+            saves.keymap_revision,
+        );
         let font = font_dirty.then(|| TerminalFont::global(cx).clone());
+        let shell = shell_dirty.then(|| TerminalShell::global(cx).clone());
         let keymap = keymap_dirty.then(|| Keymap::global(cx).clone());
         let font_path = self.storage_path.with_file_name("terminal-font.json");
+        let shell_path = self.storage_path.with_file_name("terminal-shell.json");
         let keymap_path = self.storage_path.with_file_name("keybindings.json");
         let save = cx.background_executor().spawn(async move {
             (
                 font.map(|font| terminal_font::save(&font_path, &font)),
+                shell.map(|shell| terminal_shell::save(&shell_path, &shell)),
                 keymap.map(|keymap| keymap::save(&keymap_path, &keymap)),
             )
         });
         cx.spawn_in(window, async move |view, cx| {
-            let (font, keymap) = save.await;
+            let (font, shell, keymap) = save.await;
             let _ = cx.update(|window, cx| {
                 let _ = view.update(cx, |view, cx| {
                     let mut failed = false;
@@ -640,6 +698,14 @@ impl TerminalManager {
                         Some(Ok(())) => view.preferences.font_saved = font_revision,
                         Some(Err(error)) => {
                             eprintln!("Terminal font preference could not be saved: {error}");
+                            failed = true;
+                        }
+                        None => {}
+                    }
+                    match shell {
+                        Some(Ok(())) => view.preferences.shell_saved = shell_revision,
+                        Some(Err(error)) => {
+                            eprintln!("Terminal shell preference could not be saved: {error}");
                             failed = true;
                         }
                         None => {}
@@ -709,6 +775,9 @@ impl TerminalManager {
                 return self.choose_appearance(*appearance, window, cx);
             }
             SettingsEvent::FontChanged(font) => return self.set_font(font.clone(), window, cx),
+            SettingsEvent::ShellChanged(shell) => {
+                return self.set_shell(shell.clone(), window, cx);
+            }
             SettingsEvent::Closed => return self.close_settings(window, cx),
             SettingsEvent::ShortcutChanged(shortcut, keystroke) => {
                 // The dialog checked this chord already; a late conflict keeps the old binding.
@@ -730,15 +799,16 @@ impl TerminalManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let grid = self
+        let (grid, tab_titles) = self
             .workspace
             .as_ref()
             .and_then(|workspace| workspace.projects.iter().find(|p| p.path == path))
-            .map(|project| project.grid.clone())
+            .map(|project| (project.grid.clone(), project.tab_titles.clone()))
             .unwrap_or_default();
         let terminal = cx.new(|cx| {
             let mut terminal = TerminalView::new(path.clone(), cx);
             terminal.restore_layout(count, active, cx);
+            terminal.restore_tab_titles(&tab_titles, cx);
             terminal.restore_grid(grid, cx);
             terminal
         });
@@ -778,6 +848,7 @@ impl TerminalManager {
                     terminal.update(cx, |terminal, cx| terminal.activate(cx));
                 }
                 let (count, active) = terminal.read(cx).layout_snapshot();
+                let tab_titles = terminal.read(cx).tab_titles_snapshot(cx);
                 let grid = terminal.read(cx).grid_snapshot();
                 if let Some(workspace) = &mut view.workspace
                     && let Some(project) = workspace
@@ -786,6 +857,7 @@ impl TerminalManager {
                         .find(|project| project.path == path)
                 {
                     project.update_layout(count, active);
+                    project.update_tab_titles(tab_titles);
                     project.grid = grid;
                 }
                 view.persist(window, cx);
@@ -891,7 +963,74 @@ impl TerminalManager {
         }
     }
 
-    fn resize(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn capture_window_bounds(
+        window: &Window,
+        previous: Option<SavedWindow>,
+    ) -> Option<SavedWindow> {
+        let valid_rect = |bounds: Bounds<Pixels>| {
+            let width = f32::from(bounds.size.width);
+            let height = f32::from(bounds.size.height);
+            (width >= window_state::MIN_WINDOW_WIDTH && height >= window_state::MIN_WINDOW_HEIGHT)
+                .then_some((
+                    f32::from(bounds.origin.x),
+                    f32::from(bounds.origin.y),
+                    width,
+                    height,
+                ))
+        };
+        match window.window_bounds() {
+            WindowBounds::Windowed(bounds) => valid_rect(bounds)
+                .map(|(x, y, width, height)| SavedWindow {
+                    x,
+                    y,
+                    width,
+                    height,
+                    mode: WindowMode::Windowed,
+                })
+                .or(previous),
+            WindowBounds::Maximized(bounds) => valid_rect(bounds)
+                .map(|(x, y, width, height)| SavedWindow {
+                    x,
+                    y,
+                    width,
+                    height,
+                    mode: WindowMode::Maximized,
+                })
+                .or_else(|| {
+                    previous.map(|prev| SavedWindow {
+                        mode: WindowMode::Maximized,
+                        ..prev
+                    })
+                }),
+            WindowBounds::Fullscreen(_) => previous,
+        }
+    }
+
+    fn schedule_window_state_save(&mut self, cx: &mut Context<Self>) {
+        if self.storage_path.as_os_str().is_empty() {
+            return;
+        }
+        let Some(saved) = self.window_bounds else {
+            return;
+        };
+        let path = self.storage_path.with_file_name("window-state.json");
+        self._window_save_task = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(350))
+                .await;
+            let _ = cx
+                .background_executor()
+                .spawn(async move { window_state::save(&path, saved) })
+                .await;
+        }));
+    }
+
+    fn resize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let next = Self::capture_window_bounds(window, self.window_bounds);
+        if next != self.window_bounds {
+            self.window_bounds = next;
+            self.schedule_window_state_save(cx);
+        }
         // Terminal elements measure their own content bounds before resizing the PTY.
         cx.notify();
     }
@@ -1065,9 +1204,18 @@ impl TerminalManager {
         self.save_failed = false;
         let revision = self.revision;
         let path = self.storage_path.clone();
-        let save = cx
-            .background_executor()
-            .spawn(async move { workspace.save(&path) });
+        let window_state_to_save = self
+            .close_after_save
+            .then_some(Self::capture_window_bounds(window, self.window_bounds))
+            .flatten()
+            .filter(|_| !path.as_os_str().is_empty());
+        let window_path = path.with_file_name("window-state.json");
+        let save = cx.background_executor().spawn(async move {
+            if let Some(state) = window_state_to_save {
+                let _ = window_state::save(&window_path, state);
+            }
+            workspace.save(&path)
+        });
         cx.spawn_in(window, async move |view, cx| {
             let result = save.await;
             let _ = cx.update(|window, cx| {
@@ -1429,20 +1577,22 @@ impl TerminalManager {
     }
 
     /// Quiet live signals for a project: Git branch, dirty change count (when non-zero),
-    /// and counts of `(exited, failed)` terminals.
+    /// counts of `(exited, failed)` terminals, and unfocused bell attention count.
     fn project_signals(
         &self,
         index: usize,
         cx: &gpui::App,
-    ) -> (Option<String>, Option<usize>, (usize, usize)) {
+    ) -> (Option<String>, Option<usize>, (usize, usize), usize) {
         let Some(project) = self.projects.get(index) else {
-            return (None, None, (0, 0));
+            return (None, None, (0, 0), 0);
         };
         let git = project.git.read(cx);
         let branch = git.branch().map(ToOwned::to_owned);
         let changes = git.change_count().filter(|&count| count > 0);
-        let stopped = project.terminal.read(cx).stopped_terminal_counts(cx);
-        (branch, changes, stopped)
+        let terminal = project.terminal.read(cx);
+        let stopped = terminal.stopped_terminal_counts(cx);
+        let attention = terminal.attention_terminal_count(cx);
+        (branch, changes, stopped, attention)
     }
 
     fn project_strip(&self, available: bool, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1462,7 +1612,8 @@ impl TerminalManager {
             })
             .map(|(index, project, active)| {
                 let name = project_name(&project.path);
-                let (branch, changes, (exited, failed)) = self.project_signals(index, cx);
+                let (branch, changes, (exited, failed), attention) =
+                    self.project_signals(index, cx);
                 let mut tooltip = project.path.to_string_lossy().into_owned();
                 if let Some(branch) = &branch {
                     tooltip.push_str(&format!("\nBranch {branch}"));
@@ -1471,6 +1622,12 @@ impl TerminalManager {
                     tooltip.push_str(&format!(
                         " · {changes} change{}",
                         if changes == 1 { "" } else { "s" }
+                    ));
+                }
+                if attention > 0 {
+                    tooltip.push_str(&format!(
+                        "\n{attention} terminal{} waiting for attention",
+                        if attention == 1 { "" } else { "s" }
                     ));
                 }
                 if failed > 0 {
@@ -1536,6 +1693,7 @@ impl TerminalManager {
                                 .child(changes.to_string()),
                         )
                     })
+                    .when(attention > 0, |tab| tab.child(attention_mark()))
                     .when(failed > 0 || exited > 0, |tab| {
                         tab.child(stopped_shell_mark(failed > 0))
                     });
@@ -2092,7 +2250,8 @@ impl TerminalManager {
                     .workspace
                     .as_ref()
                     .is_some_and(|workspace| workspace.active == index);
-                let (branch, changes, (exited, failed)) = self.project_signals(index, cx);
+                let (branch, changes, (exited, failed), attention) =
+                    self.project_signals(index, cx);
                 div()
                     .id(("choose-project", index))
                     .h(px(chrome::MENU_ROW_HEIGHT))
@@ -2145,6 +2304,7 @@ impl TerminalManager {
                                 .child(changes.to_string()),
                         )
                     })
+                    .when(attention > 0, |row| row.child(attention_mark()))
                     .when(failed > 0 || exited > 0, |row| {
                         row.child(stopped_shell_mark(failed > 0))
                     })
@@ -2444,7 +2604,8 @@ impl TerminalManager {
                     .projects
                     .get(index)
                     .map_or(0, |project| project.terminal.read(cx).terminal_count());
-                let (branch, changes, (exited, failed)) = self.project_signals(index, cx);
+                let (branch, changes, (exited, failed), attention) =
+                    self.project_signals(index, cx);
                 let mut detail_parts = Vec::with_capacity(3);
                 if let Some(branch) = branch {
                     detail_parts.push(branch);
@@ -2561,6 +2722,7 @@ impl TerminalManager {
                                 .child(changes.to_string()),
                         )
                     })
+                    .when(attention > 0, |row| row.child(attention_mark()))
                     .when(failed > 0 || exited > 0, |row| {
                         row.child(stopped_shell_mark(failed > 0))
                     })
@@ -2784,6 +2946,15 @@ fn project_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Accent diamond for an unfocused terminal that rang the bell; distinct in shape from stopped dots.
+pub(super) fn attention_mark() -> impl IntoElement {
+    svg()
+        .path("icons/agent-diamond.svg")
+        .size(px(10.0))
+        .flex_shrink_0()
+        .text_color(theme::focus())
 }
 
 /// Filled dot for a failed terminal, hollow ring for an exited one: differs by shape as well as color.
@@ -3595,6 +3766,8 @@ mod tests {
             update_generation: 0,
             update_restart_pending: false,
             update_scheduling: false,
+            window_bounds: None,
+            _window_save_task: None,
             _bounds_subscription: Subscription::new(|| {}),
         }
     }
@@ -4341,5 +4514,122 @@ mod tests {
                 assert_eq!(view.notice, None);
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn missing_saved_shell_falls_back_to_system_default_with_a_notice(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (manager, _, cx) = manager_with_one_terminal(cx);
+        let missing =
+            TerminalShell::with_program(Some(PathBuf::from("definitely-missing-pwsh.exe")));
+        manager.update(cx, |view, cx| {
+            view.install_shell(missing, cx);
+            assert!(
+                view.notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("no longer installed"))
+            );
+        });
+        cx.update(|_, app| assert!(TerminalShell::global(app).is_default()));
+    }
+
+    #[gpui::test]
+    fn settings_shell_picker_opens_and_applies_choice_inside_deferred_dialog(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (manager, _, cx) = manager_with_one_terminal(cx);
+        let temp_dir =
+            std::env::temp_dir().join(format!("zeod-settings-shell-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        manager.update(cx, |view, _| {
+            view.storage_path = temp_dir.join("workspace.json");
+        });
+        let custom = TerminalShell::with_program(Some(PathBuf::from(
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+        )));
+        cx.simulate_resize(gpui::size(px(1200.0), px(800.0)));
+        cx.simulate_keystrokes("ctrl-,");
+        cx.refresh().unwrap();
+        let panel = manager
+            .read_with(cx, |view, _| view.settings.clone())
+            .expect("settings dialog should open");
+        panel.update(cx, |panel, cx| {
+            panel.set_shells_for_test(
+                vec![
+                    terminal_shell::ShellChoice::system_default(),
+                    terminal_shell::ShellChoice {
+                        shell: custom.clone(),
+                        label: "PowerShell 7".into(),
+                        detail: "pwsh.exe".into(),
+                    },
+                ],
+                cx,
+            );
+        });
+        cx.refresh().unwrap();
+
+        let trigger = cx
+            .debug_bounds("settings-shell-trigger")
+            .expect("shell picker trigger should render");
+        cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+        cx.refresh().unwrap();
+
+        let menu = cx
+            .debug_bounds("settings-shell-menu")
+            .expect("shell menu should render without nested deferred draw");
+        assert!(
+            (f32::from(menu.left()) - f32::from(trigger.left())).abs() <= 1.0,
+            "menu left {} should align with trigger left {}",
+            f32::from(menu.left()),
+            f32::from(trigger.left()),
+        );
+        assert!(
+            menu.top() >= trigger.bottom(),
+            "menu top {} should sit below trigger bottom {}",
+            f32::from(menu.top()),
+            f32::from(trigger.bottom()),
+        );
+        let focus_inside =
+            cx.update(|window, app| panel.read(app).focus_handle().contains_focused(window, app));
+        assert!(focus_inside);
+
+        let option = cx
+            .debug_bounds("settings-shell-option-1")
+            .expect("custom shell option should render");
+        cx.simulate_click(option.center(), gpui::Modifiers::none());
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        assert!(manager.read_with(cx, |view, _| view.settings.is_some()));
+        assert!(!panel.read_with(cx, |panel, _| panel.shell_menu_open()));
+        cx.update(|_, app| assert_eq!(*TerminalShell::global(app), custom));
+
+        // Clicking the trigger toggles the menu open and closed without closing Settings.
+        cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert!(panel.read_with(cx, |panel, _| panel.shell_menu_open()));
+        cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert!(!panel.read_with(cx, |panel, _| panel.shell_menu_open()));
+        assert!(manager.read_with(cx, |view, _| view.settings.is_some()));
+
+        // Opening again and pressing Escape closes only the dropdown first, then the dialog.
+        cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert!(panel.read_with(cx, |panel, _| panel.shell_menu_open()));
+        cx.simulate_keystrokes("escape");
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert!(!panel.read_with(cx, |panel, _| panel.shell_menu_open()));
+        assert!(manager.read_with(cx, |view, _| view.settings.is_some()));
+        cx.simulate_keystrokes("escape");
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert!(manager.read_with(cx, |view, _| view.settings.is_none()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

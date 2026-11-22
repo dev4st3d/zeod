@@ -313,4 +313,83 @@ fn publish_push_fetch_and_rejected_push_use_only_a_local_bare_remote() {
         text(&bare, &args(&["rev-parse", "refs/heads/main"])).unwrap(),
         remote_head
     );
+    // Fast-forward pull refuses diverged history without moving HEAD.
+    let diverged_plan = pull_plan(&diverged).unwrap();
+    let error = pull(&diverged_plan).unwrap_err();
+    assert!(error.contains("diverged"), "{error}");
+    assert_eq!(repository(&repo.0).unwrap().head, diverged.head);
+}
+
+#[test]
+fn pull_fast_forwards_cleanly_and_detects_up_to_date_and_stale_plans() {
+    let repo = Repo::new();
+    repo.put("file.txt", "base\n");
+    repo.save("Initial");
+    let bare = repo.0.join("remote.git");
+    repo.git(&["init", "--bare", bare.to_str().unwrap()]);
+    repo.git(&["remote", "add", "origin", bare.to_str().unwrap()]);
+    fs::write(repo.0.join(".gitignore"), "remote.git/\nother/\n").unwrap();
+    push(&push_plan(&repository(&repo.0).unwrap(), Some("origin")).unwrap()).unwrap();
+
+    let other_path = repo.0.join("other");
+    repo.git(&[
+        "clone",
+        "-b",
+        "main",
+        bare.to_str().unwrap(),
+        other_path.to_str().unwrap(),
+    ]);
+    let other = Repo(other_path);
+    other.configure();
+    other.put("incoming.txt", "from remote\n");
+    let remote_head = other.save("Incoming");
+    other.git(&["push", "origin", "main"]);
+
+    fetch(&repository(&repo.0).unwrap(), "origin").unwrap();
+    let behind = repository(&repo.0).unwrap();
+    assert_eq!(behind.behind, Some(1));
+    let notice = pull(&pull_plan(&behind).unwrap()).unwrap();
+    assert!(notice.contains("Pulled from origin/main"), "{notice}");
+    assert_eq!(
+        repository(&repo.0).unwrap().head.as_deref(),
+        Some(remote_head.as_str())
+    );
+    assert_eq!(
+        fs::read_to_string(repo.0.join("incoming.txt")).unwrap(),
+        "from remote\n"
+    );
+
+    // Pulling again when already aligned reports up to date.
+    let synced = repository(&repo.0).unwrap();
+    assert_eq!(
+        pull(&pull_plan(&synced).unwrap()).unwrap(),
+        "Already up to date."
+    );
+
+    // A stale pull plan is rejected after local HEAD moves.
+    let stale_plan = pull_plan(&synced).unwrap();
+    repo.put("local.txt", "local\n");
+    repo.save("Local");
+    assert!(pull(&stale_plan).is_err());
+}
+
+#[test]
+fn create_branch_validates_names_and_works_on_normal_and_unborn_repositories() {
+    let repo = Repo::new();
+    // Unborn repository (no commits yet) accepts a valid branch creation.
+    create_branch(&repo.0, "feature/start").unwrap();
+    assert_eq!(read_status(&repo.0).unwrap().branch, "feature/start");
+
+    repo.put("file.txt", "one\n");
+    repo.save("Initial");
+    create_branch(&repo.0, "topic").unwrap();
+    assert_eq!(read_status(&repo.0).unwrap().branch, "topic");
+    assert!(branches(&repo.0).unwrap().contains(&"topic".to_owned()));
+
+    // Duplicate, empty, leading-dash, and invalid ref names are rejected.
+    assert!(create_branch(&repo.0, "topic").is_err());
+    assert!(create_branch(&repo.0, "   ").is_err());
+    assert!(create_branch(&repo.0, "-flag").is_err());
+    assert!(create_branch(&repo.0, "bad name").is_err());
+    assert!(create_branch(&repo.0, "a..b").is_err());
 }

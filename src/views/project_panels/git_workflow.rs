@@ -6,6 +6,7 @@ enum WriteAction {
     Stage(Vec<GitEntry>, bool),
     Commit(workflow::Repository, String),
     Push(workflow::PushPlan),
+    Pull(workflow::PullPlan),
     Fetch(workflow::Repository, String),
     Discard(workflow::DiscardPlan),
     Init,
@@ -18,6 +19,7 @@ impl WriteAction {
             Self::Stage(_, false) => "Unstaging…",
             Self::Commit(..) => "Committing…",
             Self::Push(..) => "Pushing…",
+            Self::Pull(..) => "Pulling…",
             Self::Fetch(..) => "Fetching…",
             Self::Discard(..) => "Discarding…",
             Self::Init => "Initializing…",
@@ -38,6 +40,7 @@ impl WriteAction {
             Self::Push(plan) => {
                 workflow::push(&plan).map(|()| format!("Pushed to {}.", plan.label()))
             }
+            Self::Pull(plan) => workflow::pull(&plan),
             Self::Fetch(repository, remote) => workflow::fetch(&repository, &remote)
                 .map(|()| "Fetched. Review incoming commits before merging.".into()),
             Self::Discard(plan) => workflow::discard(&plan).map(|()| {
@@ -78,7 +81,10 @@ impl GitPanel {
             return;
         }
         let is_commit = matches!(action, WriteAction::Commit(..));
-        let changes_disk = matches!(action, WriteAction::Discard(_) | WriteAction::Init);
+        let changes_disk = matches!(
+            action,
+            WriteAction::Discard(_) | WriteAction::Pull(_) | WriteAction::Init
+        );
         self.operation = Some(action.label());
         self.operation_error = None;
         self.notice = None;
@@ -184,6 +190,22 @@ impl GitPanel {
         }
         match workflow::push_plan(&repository, remote.as_deref()) {
             Ok(plan) => self.perform_git(WriteAction::Push(plan), window, cx),
+            Err(error) => {
+                self.operation_error = Some(error);
+                cx.notify();
+            }
+        }
+    }
+
+    pub(super) fn pull_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.git_busy() || self.loading {
+            return;
+        }
+        let Some(repository) = self.repository.clone() else {
+            return;
+        };
+        match workflow::pull_plan(&repository) {
+            Ok(plan) => self.perform_git(WriteAction::Pull(plan), window, cx),
             Err(error) => {
                 self.operation_error = Some(error);
                 cx.notify();
@@ -721,6 +743,53 @@ impl GitPanel {
         }
     }
 
+    fn can_pull(&self) -> bool {
+        !self.git_busy()
+            && !self.loading
+            && self.repository.as_ref().is_some_and(|repo| {
+                repo.branch.is_some()
+                    && repo.upstream.is_some()
+                    && repo.behind.is_some_and(|behind| behind > 0)
+            })
+    }
+
+    fn pull_label(&self) -> String {
+        if self.operation == Some("Pulling…") {
+            "Pulling…".to_string()
+        } else if let Some(count) = self
+            .repository
+            .as_ref()
+            .and_then(|repo| repo.behind)
+            .filter(|count| *count > 0)
+        {
+            format!("Pull {count}")
+        } else {
+            "Pull".to_string()
+        }
+    }
+
+    fn pull_tooltip(&self) -> String {
+        self.repository
+            .as_ref()
+            .and_then(|repo| repo.upstream.as_ref())
+            .map(|upstream| format!("Fast-forward pull from {}", upstream.label))
+            .unwrap_or_else(|| "Pull from upstream".to_string())
+    }
+
+    fn pull_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        git_control(
+            "git-pull",
+            "",
+            Some("icons/arrow-down.svg"),
+            self.can_pull(),
+        )
+        .h(px(28.0))
+        .child(self.pull_label())
+        .tooltip(text_tooltip(self.pull_tooltip()))
+        .on_click(cx.listener(|view, _, window, cx| view.pull_current(window, cx)))
+        .into_any_element()
+    }
+
     fn push_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         git_control("git-push", "", Some("icons/arrow-up.svg"), self.can_push())
             .h(px(28.0))
@@ -809,6 +878,23 @@ impl GitPanel {
                             )
                         },
                     )
+                    .when_some(
+                        self.repository
+                            .as_ref()
+                            .and_then(|repo| repo.behind)
+                            .filter(|behind| *behind > 0),
+                        |control, behind| {
+                            control.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .font_family(theme::mono())
+                                    .text_size(px(11.0))
+                                    .line_height(px(16.0))
+                                    .text_color(theme::focus())
+                                    .child(format!("↓{behind}")),
+                            )
+                        },
+                    )
                     .child(
                         svg()
                             .path(if open {
@@ -867,6 +953,8 @@ impl GitPanel {
                     return;
                 }
                 view.branch_picker = false;
+                view.branch_creating = false;
+                view.branch_error = None;
                 cx.notify();
             }))
             .child(
@@ -931,6 +1019,107 @@ impl GitPanel {
                         .text_size(px(12.0))
                         .text_color(theme::ash())
                         .child("No local branches yet."),
+                )
+            })
+            .when(!self.not_repository, |list| {
+                let highlighted =
+                    !self.branch_creating && self.branch_selected == self.branches.len();
+                list.child(
+                    div()
+                        .mt(px(4.0))
+                        .pt(px(4.0))
+                        .border_t_1()
+                        .border_color(theme::edge())
+                        .when(!self.branch_creating, |section| {
+                            section.child(
+                                div()
+                                    .id("branch-new")
+                                    .h(px(chrome::OPTION_ROW_HEIGHT))
+                                    .w_full()
+                                    .px(px(8.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .rounded(px(4.0))
+                                    .border_1()
+                                    .border_color(if highlighted {
+                                        theme::edge_hard()
+                                    } else {
+                                        rgba(0)
+                                    })
+                                    .bg(if highlighted {
+                                        theme::selection()
+                                    } else {
+                                        rgba(0)
+                                    })
+                                    .text_size(px(12.0))
+                                    .text_color(theme::bone())
+                                    .when(enabled, |row| {
+                                        row.cursor_pointer()
+                                            .hover(|style| style.bg(theme::panel_hover()))
+                                            .on_click(cx.listener(|view, _, window, cx| {
+                                                view.begin_create_branch(window, cx)
+                                            }))
+                                    })
+                                    .child(panel_icon("icons/plus.svg"))
+                                    .child("New branch…"),
+                            )
+                        })
+                        .when(self.branch_creating, |section| {
+                            section.child(
+                                div()
+                                    .p(px(4.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(6.0))
+                                    .on_key_down(cx.listener(
+                                        |view, event: &KeyDownEvent, window, cx| {
+                                            if event.keystroke.key == "escape" {
+                                                view.cancel_create_branch(window, cx);
+                                                cx.stop_propagation();
+                                            }
+                                        },
+                                    ))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .child(
+                                                div().flex_1().min_w_0().child(
+                                                    Input::new(&self.branch_input)
+                                                        .h(px(28.0))
+                                                        .font_family(theme::mono())
+                                                        .text_size(px(12.0))
+                                                        .disabled(self.switching),
+                                                ),
+                                            )
+                                            .child(
+                                                git_control(
+                                                    "branch-create-submit",
+                                                    if self.switching { "…" } else { "Create" },
+                                                    None,
+                                                    !self.switching,
+                                                )
+                                                .h(px(28.0))
+                                                .px(px(8.0))
+                                                .on_click(cx.listener(|view, _, window, cx| {
+                                                    view.submit_create_branch(window, cx)
+                                                })),
+                                            ),
+                                    )
+                                    .when_some(self.branch_error.clone(), |form, error| {
+                                        form.child(
+                                            div()
+                                                .px(px(4.0))
+                                                .text_size(px(11.0))
+                                                .line_height(px(15.0))
+                                                .text_color(theme::error())
+                                                .child(error),
+                                        )
+                                    }),
+                            )
+                        }),
                 )
             })
     }
@@ -1087,7 +1276,9 @@ impl GitPanel {
         let can_commit = self.can_commit(cx);
         let committing = self.operation == Some("Committing…");
         let pushing = self.operation == Some("Pushing…");
+        let pulling = self.operation == Some("Pulling…");
         let show_push = pushing || self.can_push();
+        let show_pull = pulling || self.can_pull();
         let focused =
             gpui::Focusable::focus_handle(self.commit_input.read(cx), cx).is_focused(window);
         let summary = match staged {
@@ -1144,10 +1335,51 @@ impl GitPanel {
                                     .text_color(theme::ash())
                                     .child(summary),
                             )
+                            .when(show_pull, |footer| footer.child(self.composer_pull(cx)))
                             .when(show_push, |footer| footer.child(self.composer_push(cx)))
                             .child(self.composer_commit(can_commit, committing, cx)),
                     ),
             )
+            .into_any_element()
+    }
+
+    /// Quiet footer action; hidden when the branch is not behind its upstream.
+    fn composer_pull(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let pulling = self.operation == Some("Pulling…");
+        div()
+            .id("git-pull")
+            .h(px(28.0))
+            .px(px(8.0))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(rgba(0))
+            .text_size(px(12.0))
+            .text_color(if pulling {
+                theme::ash()
+            } else {
+                theme::bone_dim()
+            })
+            .tooltip(text_tooltip(self.pull_tooltip()))
+            .when(!pulling, |button| {
+                button
+                    .tab_index(0)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::panel_hover()).text_color(theme::bone()))
+                    .focus(|style| style.border_color(theme::focus()))
+                    .on_click(cx.listener(|view, _, window, cx| view.pull_current(window, cx)))
+            })
+            .child(
+                svg()
+                    .path("icons/arrow-down.svg")
+                    .size(px(14.0))
+                    .flex_shrink_0()
+                    .text_color(theme::ash()),
+            )
+            .child(self.pull_label())
             .into_any_element()
     }
 
@@ -1344,6 +1576,31 @@ impl GitPanel {
                                 .justify_center()
                                 .gap(px(6.0))
                                 .when(
+                                    behind > 0 || self.operation == Some("Pulling…"),
+                                    |actions| {
+                                        actions.child(
+                                            git_primary(
+                                                "git-clean-pull",
+                                                self.pull_label(),
+                                                "icons/arrow-down.svg",
+                                                self.can_pull(),
+                                            )
+                                            .h(px(32.0))
+                                            .tooltip(text_tooltip(self.pull_tooltip()))
+                                            .when(
+                                                self.can_pull(),
+                                                |button| {
+                                                    button.on_click(cx.listener(
+                                                        |view, _, window, cx| {
+                                                            view.pull_current(window, cx)
+                                                        },
+                                                    ))
+                                                },
+                                            ),
+                                        )
+                                    },
+                                )
+                                .when(
                                     repository.is_some_and(|repo| repo.upstream.is_some()),
                                     |actions| {
                                         actions.child(
@@ -1427,6 +1684,11 @@ impl GitPanel {
                                     .child(status),
                             )
                         },
+                    )
+                    .when(
+                        self.history.visible
+                            && (self.can_pull() || self.operation == Some("Pulling…")),
+                        |header| header.child(self.pull_button(cx)),
                     )
                     .when(self.history.visible, |header| {
                         header.child(self.push_button(cx))

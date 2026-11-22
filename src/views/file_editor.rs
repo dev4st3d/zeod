@@ -7,7 +7,7 @@ use gpui::{
     App, Context, Entity, EventEmitter, FontWeight, IntoElement, Render, Subscription, Task,
     Window, actions, div, prelude::*, px,
 };
-use gpui_component::input::{Input, InputEvent, InputState, Rope};
+use gpui_component::input::{Input, InputEvent, InputState, Position, Rope};
 use gpui_component::{Theme, ThemeMode};
 
 use crate::services::keymap::Shortcut;
@@ -47,6 +47,7 @@ pub(crate) struct FileEditor {
     error_during_load: bool,
     prompt_pending: bool,
     close_after_save: bool,
+    pending_position: Option<Position>,
     generation: u64,
     _input_subscription: Subscription,
     _load_task: Option<Task<()>>,
@@ -144,6 +145,7 @@ impl FileEditor {
             error_during_load: false,
             prompt_pending: false,
             close_after_save: false,
+            pending_position: None,
             generation: 0,
             _input_subscription: subscription,
             _load_task: None,
@@ -161,6 +163,28 @@ impl FileEditor {
 
     pub(crate) fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.input.update(cx, |input, cx| input.focus(window, cx));
+    }
+
+    /// Move the caret to a 1-based `(line, column)` once the file buffer is ready.
+    pub(crate) fn reveal_position(
+        &mut self,
+        line: u32,
+        column: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let position = Position {
+            line: line.saturating_sub(1),
+            character: column.unwrap_or(1).saturating_sub(1),
+        };
+        if self.snapshot.is_some() && !self.loading {
+            self.pending_position = None;
+            self.input.update(cx, |input, cx| {
+                input.set_cursor_position(position, window, cx)
+            });
+        } else {
+            self.pending_position = Some(position);
+        }
     }
 
     pub(crate) fn is_dirty(&self) -> bool {
@@ -230,6 +254,11 @@ impl FileEditor {
                             editor.snapshot = Some(snapshot);
                             editor.dirty = false;
                             editor.error = None;
+                            if let Some(position) = editor.pending_position.take() {
+                                editor.input.update(cx, |input, cx| {
+                                    input.set_cursor_position(position, window, cx)
+                                });
+                            }
                         }
                         Err(error) => editor.error = Some(error),
                     }
@@ -664,5 +693,42 @@ mod tests {
         assert_eq!(events.try_recv().unwrap(), FileEditorEvent::CloseReady);
         assert_eq!(events.try_recv().unwrap(), FileEditorEvent::Changed);
         assert!(events.try_recv().is_err());
+    }
+
+    #[gpui::test]
+    fn reveal_position_moves_cursor_to_one_based_line_and_column(cx: &mut TestAppContext) {
+        cx.update(FileEditor::initialize);
+        let text = "first line\nsecond line\nthird line here\n";
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let editor = cx.new(|cx| {
+                let mut editor = FileEditor::new(
+                    Source {
+                        project: PathBuf::from("synthetic-project"),
+                        path: PathBuf::from("synthetic-project/file.rs"),
+                    },
+                    text,
+                    window,
+                    cx,
+                );
+                editor.snapshot = Some(snapshot(text));
+                editor
+            });
+            Root::new(editor, window, cx)
+        });
+        let editor = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<FileEditor>().ok().unwrap()
+        });
+        cx.update(|window, app| {
+            editor.update(app, |editor, cx| {
+                editor.reveal_position(3, Some(7), window, cx);
+                assert_eq!(
+                    editor.input.read(cx).cursor_position(),
+                    Position {
+                        line: 2,
+                        character: 6,
+                    }
+                );
+            });
+        });
     }
 }

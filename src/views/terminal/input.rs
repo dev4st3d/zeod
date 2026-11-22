@@ -1,16 +1,20 @@
 use std::ops::Range;
 
 use gpui::{
-    Bounds, Context, EntityInputHandler, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, UTF16Selection, Window, px,
+    Bounds, Context, EntityInputHandler, KeyDownEvent, Modifiers, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent,
+    UTF16Selection, Window, px,
 };
 
-use super::{TerminalSession, TerminalStatus, terminal_key_bytes};
+use super::{
+    HoveredLink, TerminalSession, TerminalSessionEvent, TerminalStatus, terminal_key_bytes,
+};
 use crate::services::keymap::{Keymap, Shortcut};
 use crate::services::terminal_engine::{
     MouseAction, MouseButton as TerminalMouseButton, MouseModifiers, SelectionKind,
 };
 use crate::services::terminal_font::TerminalFont;
+use crate::services::terminal_links::{self, LinkTarget, ResolvedLink};
 
 impl TerminalSession {
     pub(super) fn on_key_down(
@@ -98,6 +102,11 @@ impl TerminalSession {
         }
         let handle = self.focus_handle.clone();
         let focused = cx.on_focus(&handle, window, |session, _, cx| {
+            session.is_focused = true;
+            if session.needs_attention {
+                session.needs_attention = false;
+                cx.emit(TerminalSessionEvent::AttentionChanged);
+            }
             if session.engine.modes().focus_reporting {
                 session.write_pty(b"\x1b[I".to_vec(), cx);
             }
@@ -105,6 +114,9 @@ impl TerminalSession {
             cx.notify();
         });
         let blurred = cx.on_blur(&handle, window, |session, _, cx| {
+            session.is_focused = false;
+            session.ctrl_held = false;
+            session.clear_hovered_link();
             if session.engine.modes().focus_reporting {
                 session.write_pty(b"\x1b[O".to_vec(), cx);
             }
@@ -116,6 +128,11 @@ impl TerminalSession {
         });
         self._focus_subscriptions = Some((focused, blurred));
         if handle.is_focused(window) {
+            self.is_focused = true;
+            if self.needs_attention {
+                self.needs_attention = false;
+                cx.emit(TerminalSessionEvent::AttentionChanged);
+            }
             self.start_cursor_blink(cx);
         }
     }
@@ -158,6 +175,132 @@ impl TerminalSession {
             .map(|geometry| geometry.cell_at(point, self.size))
     }
 
+    pub(super) fn clear_hovered_link(&mut self) -> bool {
+        self.link_probe_generation = self.link_probe_generation.wrapping_add(1);
+        self._link_probe_task = None;
+        self.hovered_link.take().is_some()
+    }
+
+    pub(super) fn on_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ctrl = event.modifiers.control && !event.modifiers.alt && !event.modifiers.platform;
+        if self.ctrl_held != ctrl {
+            self.ctrl_held = ctrl;
+            self.update_link_hover(cx);
+        }
+    }
+
+    pub(super) fn update_link_hover(&mut self, cx: &mut Context<Self>) {
+        if !self.ctrl_held || self.selecting {
+            if self.clear_hovered_link() {
+                cx.notify();
+            }
+            return;
+        }
+        let Some(pointer) = self.last_pointer else {
+            if self.clear_hovered_link() {
+                cx.notify();
+            }
+            return;
+        };
+        let Some(geometry) = self.geometry else {
+            return;
+        };
+        if !geometry.bounds.contains(&pointer) {
+            if self.clear_hovered_link() {
+                cx.notify();
+            }
+            return;
+        }
+        let (row, col, _) = geometry.cell_at(pointer, self.size);
+        if self
+            .hovered_link
+            .as_ref()
+            .is_some_and(|link| link.row == row && link.cols.contains(&col))
+        {
+            return;
+        }
+        let Some(cells) = self.engine.row_cells(row) else {
+            if self.clear_hovered_link() {
+                cx.notify();
+            }
+            return;
+        };
+        let Some(detected) = terminal_links::link_at(row, &cells, col) else {
+            if self.clear_hovered_link() {
+                cx.notify();
+            }
+            return;
+        };
+        match detected.target {
+            LinkTarget::Url(url) => {
+                self.link_probe_generation = self.link_probe_generation.wrapping_add(1);
+                self._link_probe_task = None;
+                self.hovered_link = Some(HoveredLink {
+                    row: detected.row,
+                    cols: detected.cols,
+                    resolved: ResolvedLink::Url(url),
+                });
+                cx.notify();
+            }
+            LinkTarget::File(candidate) => {
+                let changed = self.clear_hovered_link();
+                let generation = self.link_probe_generation;
+                let workspace = self.workspace.clone();
+                let cols = detected.cols;
+                let probe = cx.background_executor().spawn(async move {
+                    terminal_links::resolve_project_file(&workspace, &candidate).map(|path| {
+                        ResolvedLink::File {
+                            path,
+                            line: candidate.line,
+                            column: candidate.column,
+                        }
+                    })
+                });
+                self._link_probe_task = Some(cx.spawn(async move |view, cx| {
+                    let resolved = probe.await;
+                    let _ = view.update(cx, |view, cx| {
+                        if view.link_probe_generation != generation || !view.ctrl_held {
+                            return;
+                        }
+                        view.hovered_link = resolved.map(|resolved| HoveredLink {
+                            row,
+                            cols,
+                            resolved,
+                        });
+                        cx.notify();
+                    });
+                }));
+                if changed {
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn activate_resolved_link(
+        &self,
+        resolved: ResolvedLink,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        match resolved {
+            ResolvedLink::Url(url) => cx.open_url(&url),
+            ResolvedLink::File { path, line, column } => {
+                cx.emit(TerminalSessionEvent::OpenFile {
+                    path,
+                    line,
+                    column,
+                    window: window.window_handle(),
+                });
+            }
+        }
+    }
+
     pub(super) fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -165,9 +308,69 @@ impl TerminalSession {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        if self.needs_attention {
+            self.needs_attention = false;
+            cx.emit(TerminalSessionEvent::AttentionChanged);
+            cx.notify();
+        }
         let Some((row, col, right_half)) = self.mouse_cell(event.position) else {
             return;
         };
+        if event.button == MouseButton::Left
+            && event.modifiers.control
+            && !event.modifiers.alt
+            && !event.modifiers.platform
+        {
+            if let Some(link) = self
+                .hovered_link
+                .as_ref()
+                .filter(|link| link.row == row && link.cols.contains(&col))
+                .cloned()
+            {
+                self.activate_resolved_link(link.resolved, window, cx);
+                cx.stop_propagation();
+                return;
+            }
+            if let Some(cells) = self.engine.row_cells(row)
+                && let Some(detected) = terminal_links::link_at(row, &cells, col)
+            {
+                match detected.target {
+                    LinkTarget::Url(url) => {
+                        self.activate_resolved_link(ResolvedLink::Url(url), window, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    LinkTarget::File(candidate) => {
+                        let workspace = self.workspace.clone();
+                        let handle = window.window_handle();
+                        let probe = cx.background_executor().spawn(async move {
+                            terminal_links::resolve_project_file(&workspace, &candidate).map(
+                                |path| ResolvedLink::File {
+                                    path,
+                                    line: candidate.line,
+                                    column: candidate.column,
+                                },
+                            )
+                        });
+                        cx.spawn(async move |view, cx| {
+                            if let Some(ResolvedLink::File { path, line, column }) = probe.await {
+                                let _ = view.update(cx, |_, cx| {
+                                    cx.emit(TerminalSessionEvent::OpenFile {
+                                        path,
+                                        line,
+                                        column,
+                                        window: handle,
+                                    });
+                                });
+                            }
+                        })
+                        .detach();
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
+            }
+        }
         let button = terminal_mouse_button(event.button);
         if self.engine.modes().mouse_tracking && !event.modifiers.shift {
             self.pressed_button = Some(button);
@@ -201,6 +404,9 @@ impl TerminalSession {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.last_pointer = Some(event.position);
+        self.ctrl_held =
+            event.modifiers.control && !event.modifiers.alt && !event.modifiers.platform;
         let Some((row, col, right_half)) = self.mouse_cell(event.position) else {
             return;
         };
@@ -214,16 +420,19 @@ impl TerminalSession {
             }
             self.engine.select_update(row, col, right_half);
             cx.notify();
-        } else if !event.modifiers.shift && self.last_mouse_cell != Some((row, col)) {
-            let button = self.pressed_button.unwrap_or(TerminalMouseButton::None);
-            if let Some(bytes) = self.engine.mouse_report(
-                button,
-                MouseAction::Motion,
-                row,
-                col,
-                mouse_modifiers(event.modifiers),
-            ) {
-                self.write_pty(bytes, cx);
+        } else {
+            self.update_link_hover(cx);
+            if !event.modifiers.shift && self.last_mouse_cell != Some((row, col)) {
+                let button = self.pressed_button.unwrap_or(TerminalMouseButton::None);
+                if let Some(bytes) = self.engine.mouse_report(
+                    button,
+                    MouseAction::Motion,
+                    row,
+                    col,
+                    mouse_modifiers(event.modifiers),
+                ) {
+                    self.write_pty(bytes, cx);
+                }
             }
         }
         self.last_mouse_cell = Some((row, col));

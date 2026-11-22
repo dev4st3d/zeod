@@ -14,15 +14,15 @@ Installed builds check GitHub Releases for updates, and restart only after you c
 
 ## Features
 
-- **Several projects at once.** Each project folder keeps its own files, Git state, and terminals.
-- **One tab strip.** Edit text, view images, and review diffs next to your terminals.
-- **Git built in.** Stage, commit, push, and browse history, with unified and split diffs.
-- **Terminals that stay put.** They start in the project directory and keep running when you switch tabs or projects.
+- **Several projects at once.** Each project folder keeps its own files, Git state, and terminals. Launch with `zeod <folder>` to jump straight to one.
+- **One tab strip.** Edit text, view images, and review diffs next to your terminals. Middle-click to close, right-click for tab actions, or double-click a terminal tab to rename it.
+- **Git built in.** Stage, commit, pull, push, create and switch branches, and browse history, with unified and split diffs.
+- **Terminals that stay put.** Pick your default shell in Settings, `Ctrl+Click` URLs or project `file:line` paths in output, and get a quiet indicator when a background terminal rings the bell.
 - **Panes.** Show one to four at once and rearrange them by dragging.
 - **Reminders per project** for small to-dos.
-- **Eleven themes** and shortcuts you can change in Settings.
+- **Eleven themes**, terminal font and shell preferences, and shortcuts you can change in Settings.
 
-Your theme, font, shortcuts, and layout stay on your machine. Zeod has no telemetry or analytics.
+Your theme, font, shell, shortcuts, window position, and layout stay on your machine. Zeod has no telemetry or analytics.
 
 ![Git history and a split diff on the Flint theme](assets/screenshots/flint.png)
 
