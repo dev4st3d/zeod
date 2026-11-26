@@ -1814,12 +1814,12 @@ mod reimagined_tests {
                     .unwrap();
                 panel
                     .collapsed
-                    .insert((DiffKind::WorkingTree, "src".into()));
+                    .insert((DiffKind::WorkingTree, "src/app".into()));
                 panel.rebuild_changes();
-                assert_eq!(panel.rows[panel.selected].path, PathBuf::from("src"));
+                assert_eq!(panel.rows[panel.selected].path, PathBuf::from("src/app"));
                 assert_eq!(panel.rows[panel.selected].kind, DiffKind::WorkingTree);
                 panel.rebuild_changes();
-                assert_eq!(panel.rows[panel.selected].path, PathBuf::from("src"));
+                assert_eq!(panel.rows[panel.selected].path, PathBuf::from("src/app"));
             })
             .unwrap();
     }
@@ -1865,5 +1865,95 @@ mod reimagined_tests {
         });
         cx.refresh().unwrap();
         assert!(cx.debug_bounds("collapse-files").is_some());
+    }
+
+    /// A throwaway repository with two committed files, both edited afterwards.
+    struct EditedRepository(PathBuf);
+
+    impl EditedRepository {
+        fn new() -> Self {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root =
+                std::env::temp_dir().join(format!("zeod-panel-{}-{stamp}", std::process::id()));
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            let repository = Self(root);
+            repository.git(&["init", "-b", "main"]);
+            for (key, value) in [
+                ("user.name", "Example Developer"),
+                ("user.email", "example@example.invalid"),
+                ("commit.gpgsign", "false"),
+                ("core.autocrlf", "false"),
+            ] {
+                repository.git(&["config", key, value]);
+            }
+            repository.write_sources("original\n");
+            repository.git(&["add", "--all"]);
+            repository.git(&["commit", "-m", "Initial"]);
+            repository.write_sources("edited\n");
+            repository
+        }
+
+        fn write_sources(&self, contents: &str) {
+            for name in ["src/a.rs", "src/b.rs"] {
+                std::fs::write(self.0.join(name), contents).unwrap();
+            }
+        }
+
+        fn git(&self, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.0)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "Synthetic Git command failed: {args:?}"
+            );
+        }
+    }
+
+    impl Drop for EditedRepository {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[gpui::test]
+    fn discard_all_asks_before_touching_files(cx: &mut gpui::TestAppContext) {
+        let repository = EditedRepository::new();
+        cx.update(|cx| {
+            crate::fonts::initialize(cx);
+            super::super::file_editor::FileEditor::initialize(cx);
+        });
+        let root = repository.0.clone();
+        let terminal = cx.new(|cx| TerminalView::new(root.clone(), cx));
+        let terminal_weak = terminal.downgrade();
+        let (panel, cx) =
+            cx.add_window_view(move |window, cx| GitPanel::new(root, terminal_weak, window, cx));
+        cx.simulate_resize(gpui::size(px(360.0), px(720.0)));
+        panel.update(cx, |panel, cx| panel.refresh(cx));
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        let button = cx
+            .debug_bounds("git-discard-all")
+            .expect("the Changes heading offers Discard all");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.operation_error, None);
+            let plan = panel
+                .pending_discard
+                .as_ref()
+                .expect("Discard all waits for confirmation");
+            assert_eq!(plan.files.len(), 2);
+        });
+        assert_eq!(
+            std::fs::read_to_string(repository.0.join("src/a.rs")).unwrap(),
+            "edited\n"
+        );
     }
 }

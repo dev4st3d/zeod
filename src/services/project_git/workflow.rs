@@ -315,6 +315,26 @@ pub(crate) fn commit(
     })
 }
 
+/// Commits with nothing staged: stages exactly the listed changes, then commits them.
+/// A failed commit leaves them staged so the next attempt commits the same set.
+pub(crate) fn commit_all(
+    project: &Path,
+    expected: &Repository,
+    entries: &[GitEntry],
+    message: &str,
+) -> Result<String, String> {
+    if message.trim().is_empty() {
+        return Err("Write a commit message first.".into());
+    }
+    if optional_head(&expected.root)? != expected.head
+        || index_snapshot(&expected.root)? != expected.index
+    {
+        return Err("Changes moved since the last refresh. Review them before committing.".into());
+    }
+    stage(project, entries, true)?;
+    commit(project, &repository(project)?, message)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PushPlan {
     pub(crate) repository: Repository,
@@ -533,26 +553,58 @@ pub(crate) fn pull(plan: &PullPlan) -> Result<String, String> {
     Err("Pull did not finish. Check authentication or your connection, then retry.".into())
 }
 
+/// Paths per Git invocation, keeping command lines well under the Windows limit.
+const PATH_BATCH: usize = 64;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FileStamp {
     index: Vec<u8>,
-    contents: Option<String>,
+    contents: Vec<Option<String>>,
     head: Option<String>,
 }
 
-fn stamp(project: &Path, path: &Path) -> Result<FileStamp, String> {
-    let relative = scoped_path(project, path)?;
-    let mut arguments = args(&["ls-files", "--stage", "-z", "--"]);
-    arguments.push(literal(&relative));
-    let index = read(project, &arguments)?;
-    let contents = match std::fs::symlink_metadata(project.join(&relative)) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            let mut arguments = args(&["hash-object", "--no-filters", "--"]); arguments.push(relative.as_os_str().to_owned());
-            Some(text(project, &arguments)?)
+/// Index entries and content hashes for `files`, in order. A missing file hashes to `None`.
+fn stamp(project: &Path, files: &[DiscardFile]) -> Result<FileStamp, String> {
+    let mut index = Vec::new();
+    let mut contents = Vec::with_capacity(files.len());
+    for batch in files.chunks(PATH_BATCH) {
+        let relative = batch
+            .iter()
+            .map(|file| scoped_path(project, &file.path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut arguments = args(&["ls-files", "--stage", "-z", "--"]);
+        arguments.extend(relative.iter().map(|path| literal(path)));
+        index.extend(read(project, &arguments)?);
+        let mut present = Vec::with_capacity(relative.len());
+        let mut arguments = args(&["hash-object", "--no-filters", "--"]);
+        for path in &relative {
+            match std::fs::symlink_metadata(project.join(path)) {
+                Ok(metadata) if metadata.file_type().is_file() => {
+                    present.push(true);
+                    arguments.push(path.as_os_str().to_owned());
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => present.push(false),
+                _ => return Err("Discard is only available for regular files. Handle symlinks and submodules in a terminal.".into()),
+            }
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        _ => return Err("Discard is only available for regular files. Handle symlinks and submodules in a terminal.".into()),
-    };
+        let hashes = if present.contains(&true) {
+            text(project, &arguments)?
+        } else {
+            String::new()
+        };
+        let mut hashes = hashes.lines();
+        for present in present {
+            let hash = if present {
+                let hash = hashes
+                    .next()
+                    .ok_or("Git returned an incomplete file snapshot. Refresh and retry.")?;
+                Some(hash.to_owned())
+            } else {
+                None
+            };
+            contents.push(hash);
+        }
+    }
     Ok(FileStamp {
         index,
         contents,
@@ -561,60 +613,102 @@ fn stamp(project: &Path, path: &Path) -> Result<FileStamp, String> {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct DiscardFile {
+    pub(crate) path: PathBuf,
+    /// New files go to the Recycle Bin; tracked files are restored from the index.
+    pub(crate) untracked: bool,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct DiscardPlan {
     pub(crate) project: PathBuf,
-    pub(crate) path: PathBuf,
-    pub(crate) untracked: bool,
+    pub(crate) files: Vec<DiscardFile>,
     snapshot: FileStamp,
 }
 
-pub(crate) fn prepare_discard(project: &Path, entry: &GitEntry) -> Result<DiscardPlan, String> {
-    if entry.conflicted {
-        return Err("Resolve this file's merge conflict before discarding changes.".into());
+impl DiscardPlan {
+    pub(crate) fn untracked_count(&self) -> usize {
+        self.files.iter().filter(|file| file.untracked).count()
+    }
+}
+
+pub(crate) fn prepare_discard(project: &Path, entries: &[GitEntry]) -> Result<DiscardPlan, String> {
+    if entries.is_empty() {
+        return Err("Choose a changed file first.".into());
+    }
+    if entries.iter().any(|entry| entry.conflicted) {
+        return Err("Resolve merge conflicts before discarding changes.".into());
     }
     let project = fs_root(project).map_err(|e| e.to_string())?;
-    let path = project.join(scoped_path(&project, &entry.path)?);
-    let before = stamp(&project, &path)?;
+    let files = entries
+        .iter()
+        .map(|entry| {
+            Ok(DiscardFile {
+                path: project.join(scoped_path(&project, &entry.path)?),
+                untracked: entry.untracked,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let before = stamp(&project, &files)?;
     let current = read_status(&project).map_err(|e| e.to_string())?;
-    if !current.entries.iter().any(|candidate| {
-        candidate.path == path
-            && candidate.untracked == entry.untracked
-            && candidate.unstaged()
-            && !candidate.conflicted
-    }) {
-        return Err("The file's Git state changed. Refresh before discarding it.".into());
+    let unstaged: HashMap<&Path, bool> = current
+        .entries
+        .iter()
+        .filter(|candidate| candidate.unstaged() && !candidate.conflicted)
+        .map(|candidate| (candidate.path.as_path(), candidate.untracked))
+        .collect();
+    if files
+        .iter()
+        .any(|file| unstaged.get(file.path.as_path()) != Some(&file.untracked))
+    {
+        return Err("Git state changed since the last refresh. Refresh before discarding.".into());
     }
-    if stamp(&project, &path)? != before {
-        return Err("The file changed while preparing the discard. Refresh and retry.".into());
+    if stamp(&project, &files)? != before {
+        return Err("Files changed while preparing the discard. Refresh and retry.".into());
     }
     Ok(DiscardPlan {
         project,
-        path,
-        untracked: entry.untracked,
+        files,
         snapshot: before,
     })
 }
 
 pub(crate) fn discard(plan: &DiscardPlan) -> Result<(), String> {
-    if stamp(&plan.project, &plan.path)? != plan.snapshot {
+    if stamp(&plan.project, &plan.files)? != plan.snapshot {
         return Err(
-            "The file or staged version changed. Review the new changes before discarding.".into(),
+            "A file or its staged version changed. Review the new changes before discarding."
+                .into(),
         );
     }
-    if plan.untracked {
-        let result = super::super::file_operations::run(
+    let tracked = plan
+        .files
+        .iter()
+        .filter(|file| !file.untracked)
+        .map(|file| scoped_path(&plan.project, &file.path))
+        .collect::<Result<Vec<_>, _>>()?;
+    for batch in tracked.chunks(PATH_BATCH) {
+        let mut arguments = args(&["restore", "--worktree", "--"]);
+        arguments.extend(batch.iter().map(|path| literal(path)));
+        write(
             &plan.project,
-            super::super::file_operations::Operation::Trash(vec![plan.path.clone()]),
-            &AtomicBool::new(false),
-        );
-        return result.error.map_or(Ok(()), Err);
+            &arguments,
+            None,
+            "Could not discard unstaged changes. Refresh and retry.",
+        )?;
     }
-    let mut arguments = args(&["restore", "--worktree", "--"]);
-    arguments.push(literal(&scoped_path(&plan.project, &plan.path)?));
-    write(
+    let untracked: Vec<PathBuf> = plan
+        .files
+        .iter()
+        .filter(|file| file.untracked)
+        .map(|file| file.path.clone())
+        .collect();
+    if untracked.is_empty() {
+        return Ok(());
+    }
+    let result = super::super::file_operations::run(
         &plan.project,
-        &arguments,
-        None,
-        "Could not discard this file's unstaged changes. Refresh and retry.",
-    )
+        super::super::file_operations::Operation::Trash(untracked),
+        &AtomicBool::new(false),
+    );
+    result.error.map_or(Ok(()), Err)
 }

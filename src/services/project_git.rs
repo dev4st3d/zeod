@@ -242,6 +242,8 @@ pub(crate) fn create_branch(root: &Path, name: &str) -> Result<(), String> {
 #[derive(Clone, Debug)]
 pub(crate) struct ChangeRow {
     pub(crate) path: PathBuf,
+    /// Display name: a file name, or a merged folder chain such as `views/terminal`.
+    pub(crate) label: String,
     pub(crate) depth: usize,
     pub(crate) kind: DiffKind,
     pub(crate) entry: Option<usize>,
@@ -280,9 +282,27 @@ pub(crate) fn filtered_change_rows(
                 if child.entry.is_none() != directory {
                     continue;
                 }
-                let path = path.join(name);
+                let mut path = path.join(name);
+                let mut label = name.to_string_lossy().into_owned();
+                let mut child = child;
+                // A folder whose only change lives in one subfolder merges with it,
+                // so `views/terminal` takes one row. The row keys on the deepest path.
+                while directory && child.children.len() == 1 {
+                    let Some((name, only)) = child
+                        .children
+                        .first_key_value()
+                        .filter(|(_, only)| only.entry.is_none())
+                    else {
+                        break;
+                    };
+                    path.push(name);
+                    label.push('/');
+                    label.push_str(&name.to_string_lossy());
+                    child = only;
+                }
                 rows.push(ChangeRow {
                     path: path.clone(),
+                    label,
                     depth,
                     kind,
                     entry: child.entry,
@@ -331,6 +351,7 @@ pub(crate) fn filtered_change_rows(
         }
         rows.push(ChangeRow {
             path: PathBuf::new(),
+            label: String::new(),
             depth: 0,
             kind,
             entry: None,
@@ -944,20 +965,45 @@ mod tests {
         )
         .unwrap();
         let mut collapsed = std::collections::HashSet::new();
-        collapsed.insert((DiffKind::WorkingTree, PathBuf::from("src")));
+        collapsed.insert((DiffKind::WorkingTree, PathBuf::from("src/app")));
         let rows = change_rows(&status, &collapsed);
         assert_eq!(rows[0].kind, DiffKind::Staged);
-        assert_eq!(
-            rows.iter()
-                .find(|r| r.kind == DiffKind::WorkingTree && r.path == Path::new("src"))
-                .unwrap()
-                .count,
-            2
-        );
+        let folder = rows
+            .iter()
+            .find(|r| r.kind == DiffKind::WorkingTree && r.path == Path::new("src/app"))
+            .unwrap();
+        assert_eq!((folder.count, folder.label.as_str()), (2, "src/app"));
+        assert!(!rows.iter().any(|r| r.path == Path::new("src")));
+        assert!(!rows.iter().any(|r| r.path == Path::new("src/app/b.rs")));
         let filtered = filtered_change_rows(&status, &std::collections::HashSet::new(), "a.rs");
         assert_eq!(filtered.iter().filter(|r| r.entry.is_some()).count(), 2);
         assert!(filtered.iter().any(|r| r.path == Path::new("src/app")));
         assert!(!filtered.iter().any(|r| r.path == Path::new("docs")));
+    }
+
+    #[test]
+    fn single_child_folder_chains_merge_into_one_row() {
+        let status = parse_status(
+            Path::new("project"),
+            b"## main\0 M src/main.rs\0 M src/services/a.rs\0 M src/views/terminal/diff.rs\0",
+            false,
+        )
+        .unwrap();
+        let rows = change_rows(&status, &std::collections::HashSet::new());
+        let labels: Vec<_> = rows.iter().map(|r| (r.depth, r.label.as_str())).collect();
+        assert_eq!(
+            labels,
+            [
+                (0, ""),
+                (1, "src"),
+                (2, "services"),
+                (3, "a.rs"),
+                (2, "views/terminal"),
+                (3, "diff.rs"),
+                (2, "main.rs"),
+            ]
+        );
+        assert_eq!(rows[4].path, Path::new("src/views/terminal"));
     }
 
     #[test]

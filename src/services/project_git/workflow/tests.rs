@@ -125,14 +125,14 @@ fn discard_checks_the_preview_snapshot_and_preserves_the_staged_version() {
     repo.put("file.txt", "staged\nsecond\n");
     stage(&repo.0, &[repo.entry("file.txt")], true).unwrap();
     repo.put("file.txt", "staged\nworking\n");
-    let old = prepare_discard(&repo.0, &repo.entry("file.txt")).unwrap();
+    let old = prepare_discard(&repo.0, &[repo.entry("file.txt")]).unwrap();
     repo.put("file.txt", "newer\nworking\n");
     assert!(discard(&old).is_err());
     assert_eq!(
         fs::read_to_string(repo.0.join("file.txt")).unwrap(),
         "newer\nworking\n"
     );
-    let plan = prepare_discard(&repo.0, &repo.entry("file.txt")).unwrap();
+    let plan = prepare_discard(&repo.0, &[repo.entry("file.txt")]).unwrap();
     discard(&plan).unwrap();
     assert_eq!(
         fs::read_to_string(repo.0.join("file.txt")).unwrap(),
@@ -143,6 +143,48 @@ fn discard_checks_the_preview_snapshot_and_preserves_the_staged_version() {
     assert!(!status.unstaged());
     commit(&repo.0, &repository(&repo.0).unwrap(), "Only staged").unwrap();
     assert_eq!(repo.git(&["show", "HEAD:file.txt"]), "staged\nsecond");
+}
+
+#[test]
+fn discarding_several_files_restores_each_and_rejects_a_stale_preview() {
+    let repo = Repo::new();
+    repo.put("a.txt", "a\n");
+    repo.put("dir/b.txt", "b\n");
+    repo.save("Initial");
+    repo.put("a.txt", "a changed\n");
+    fs::remove_file(repo.0.join("dir/b.txt")).unwrap();
+    let entries = [repo.entry("a.txt"), repo.entry("dir/b.txt")];
+    let stale = prepare_discard(&repo.0, &entries).unwrap();
+    assert_eq!(stale.files.len(), 2);
+    assert_eq!(stale.untracked_count(), 0);
+    repo.put("dir/b.txt", "recreated\n");
+    assert!(discard(&stale).is_err());
+    assert_eq!(
+        fs::read_to_string(repo.0.join("a.txt")).unwrap(),
+        "a changed\n"
+    );
+    let entries = [repo.entry("a.txt"), repo.entry("dir/b.txt")];
+    discard(&prepare_discard(&repo.0, &entries).unwrap()).unwrap();
+    assert_eq!(fs::read_to_string(repo.0.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(fs::read_to_string(repo.0.join("dir/b.txt")).unwrap(), "b\n");
+    assert!(read_status(&repo.0).unwrap().entries.is_empty());
+}
+
+#[test]
+fn commit_all_stages_listed_changes_including_new_files() {
+    let repo = Repo::new();
+    repo.put("tracked.txt", "base\n");
+    repo.save("Initial");
+    repo.put("tracked.txt", "changed\n");
+    repo.put("new.txt", "new\n");
+    let entries = read_status(&repo.0).unwrap().entries;
+    let expected = repository(&repo.0).unwrap();
+    assert!(commit_all(&repo.0, &expected, &entries, "  ").is_err());
+    assert!(repo.git(&["diff", "--cached", "--name-only"]).is_empty());
+    commit_all(&repo.0, &expected, &entries, "Everything").unwrap();
+    assert!(read_status(&repo.0).unwrap().entries.is_empty());
+    assert_eq!(repo.git(&["show", "HEAD:new.txt"]), "new");
+    assert_eq!(repo.git(&["log", "-1", "--format=%s"]), "Everything");
 }
 
 #[test]

@@ -4,7 +4,8 @@ use project_git::ReviewAction;
 
 enum WriteAction {
     Stage(Vec<GitEntry>, bool),
-    Commit(workflow::Repository, String),
+    /// With nothing staged, the listed changes are staged first and committed together.
+    Commit(workflow::Repository, String, Vec<GitEntry>),
     Push(workflow::PushPlan),
     Pull(workflow::PullPlan),
     Fetch(workflow::Repository, String),
@@ -35,8 +36,14 @@ impl WriteAction {
                 }
                 .into()
             }),
-            Self::Commit(repository, message) => workflow::commit(root, &repository, &message)
-                .map(|id| format!("Commit saved · {}", &id[..7])),
+            Self::Commit(repository, message, unstaged) => {
+                let saved = if unstaged.is_empty() {
+                    workflow::commit(root, &repository, &message)
+                } else {
+                    workflow::commit_all(root, &repository, &unstaged, &message)
+                };
+                saved.map(|id| format!("Commit saved · {}", &id[..7]))
+            }
             Self::Push(plan) => {
                 workflow::push(&plan).map(|()| format!("Pushed to {}.", plan.label()))
             }
@@ -44,10 +51,14 @@ impl WriteAction {
             Self::Fetch(repository, remote) => workflow::fetch(&repository, &remote)
                 .map(|()| "Fetched. Review incoming commits before merging.".into()),
             Self::Discard(plan) => workflow::discard(&plan).map(|()| {
-                if plan.untracked {
-                    "New file moved to the Recycle Bin.".into()
-                } else {
-                    "Unstaged changes discarded.".into()
+                let files = plan.files.len();
+                match (files, plan.untracked_count()) {
+                    (1, 1) => "New file moved to the Recycle Bin.".into(),
+                    (1, _) => "Unstaged changes discarded.".into(),
+                    (_, 0) => format!("Discarded changes in {files} files."),
+                    (_, _) => format!(
+                        "Discarded changes in {files} files. New files are in the Recycle Bin."
+                    ),
                 }
             }),
             Self::Init => workflow::init(root).map(|()| "Git repository created.".into()),
@@ -131,9 +142,8 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.loading {
-            return;
-        }
+        // A background refresh does not block staging: `perform_git` supersedes it
+        // and refreshes again afterwards, so a click is never silently dropped.
         self.perform_git(WriteAction::Stage(entries, staged), window, cx);
     }
 
@@ -144,6 +154,7 @@ impl GitPanel {
         self.perform_git(WriteAction::Init, window, cx);
     }
 
+    /// Commits the staged changes, or every listed change when nothing is staged.
     pub(super) fn commit_staged(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.can_commit(cx) {
             return;
@@ -151,8 +162,23 @@ impl GitPanel {
         let Some(repository) = self.repository.clone() else {
             return;
         };
+        let unstaged = if self.staged_count() == 0 {
+            self.review_entries(DiffKind::WorkingTree)
+        } else {
+            Vec::new()
+        };
         let message = self.commit_input.read(cx).value().to_string();
-        self.perform_git(WriteAction::Commit(repository, message), window, cx);
+        self.perform_git(
+            WriteAction::Commit(repository, message, unstaged),
+            window,
+            cx,
+        );
+    }
+
+    fn staged_count(&self) -> usize {
+        self.status.as_ref().map_or(0, |status| {
+            status.entries.iter().filter(|entry| entry.staged()).count()
+        })
     }
 
     fn can_commit(&self, cx: &gpui::App) -> bool {
@@ -162,7 +188,7 @@ impl GitPanel {
             && !self.commit_input.read(cx).value().trim().is_empty()
             && self.status.as_ref().is_some_and(|status| {
                 !status.truncated
-                    && status.entries.iter().any(GitEntry::staged)
+                    && !status.entries.is_empty()
                     && !status.entries.iter().any(|entry| entry.conflicted)
             })
     }
@@ -230,13 +256,15 @@ impl GitPanel {
         }
     }
 
+    /// Prepares a confirmation for discarding the unstaged changes in `entries`.
     pub(super) fn request_discard(
         &mut self,
-        entry: GitEntry,
+        entries: Vec<GitEntry>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.git_busy() || self.loading {
+        // Preparing re-reads Git state itself, so an in-flight refresh need not block it.
+        if self.git_busy() || entries.is_empty() {
             return;
         }
         self.operation = Some("Preparing discard…");
@@ -246,7 +274,7 @@ impl GitPanel {
         let root = self.root.clone();
         let work = cx
             .background_executor()
-            .spawn(async move { workflow::prepare_discard(&root, &entry) });
+            .spawn(async move { workflow::prepare_discard(&root, &entries) });
         cx.spawn(async move |view, cx| {
             let result = work.await;
             let _ = view.update(cx, |view, cx| {
@@ -348,7 +376,7 @@ impl GitPanel {
                     .cloned();
                 if let Some(entry) = entry {
                     if *action == ReviewAction::Discard {
-                        self.request_discard(entry, window, cx);
+                        self.request_discard(vec![entry], window, cx);
                     } else {
                         self.stage_entries(
                             vec![entry],
@@ -482,6 +510,90 @@ fn stage_icon(kind: DiffKind) -> &'static str {
     }
 }
 
+const SECTION_ROW_HEIGHT: f32 = 32.0;
+const SECTION_GAP: f32 = 8.0;
+// Tree metrics match the Files panel so both sidebars read as one tree.
+const DISCLOSURE_WIDTH: f32 = 12.0;
+const ROW_INSET: f32 = 8.0;
+const ROW_ACTION_SIZE: f32 = 24.0;
+const ROW_ACTION_GAP: f32 = 2.0;
+const ROW_ACTIONS_WIDTH: f32 = ROW_ACTION_SIZE * 2.0 + ROW_ACTION_GAP;
+
+fn disclosure(expanded: bool) -> impl IntoElement {
+    div()
+        .w(px(DISCLOSURE_WIDTH))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .child(panel_icon(if expanded {
+            "icons/chevron-down.svg"
+        } else {
+            "icons/chevron-right.svg"
+        }))
+}
+
+fn count_label(count: usize) -> impl IntoElement {
+    div()
+        .flex_shrink_0()
+        .font_family(theme::mono())
+        .text_size(px(chrome::DETAIL_TEXT_SIZE))
+        .line_height(px(chrome::DETAIL_LINE_HEIGHT))
+        .text_color(theme::ash())
+        .child(count.to_string())
+}
+
+/// Added and removed line counts; zero sides are omitted and unknown counts show nothing.
+fn line_counts(stats: Option<project_git::GitLineStats>, conflicted: bool) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .font_family(theme::mono())
+        .text_size(px(chrome::DETAIL_TEXT_SIZE))
+        .line_height(px(chrome::DETAIL_LINE_HEIGHT))
+        .when(conflicted, |counts| {
+            counts.child(div().text_color(theme::error()).child("Conflict"))
+        })
+        .when_some(stats.filter(|_| !conflicted), |counts, stats| {
+            counts
+                .when(stats.additions > 0, |counts| {
+                    counts.child(
+                        div()
+                            .text_color(theme::success())
+                            .child(format!("+{}", stats.additions)),
+                    )
+                })
+                .when(stats.deletions > 0, |counts| {
+                    counts.child(
+                        div()
+                            .text_color(theme::error())
+                            .child(format!("−{}", stats.deletions)),
+                    )
+                })
+        })
+}
+
+/// Compact icon action for change rows and section headings; its tooltip names it.
+fn row_action(
+    id: impl Into<gpui::ElementId>,
+    icon: &'static str,
+    enabled: bool,
+) -> gpui::Stateful<gpui::Div> {
+    git_quiet(git_control(id, "", None, enabled))
+        .size(px(ROW_ACTION_SIZE))
+        .px_0()
+        .child(svg().path(icon).size(px(14.0)).text_color(if enabled {
+            theme::bone_dim()
+        } else {
+            theme::smoke()
+        }))
+}
+
+/// Holds the discard column on rows that cannot discard, keeping actions aligned.
+fn action_spacer() -> impl IntoElement {
+    div().w(px(ROW_ACTION_SIZE)).flex_shrink_0()
+}
+
 impl GitPanel {
     pub(super) fn render_change_row(
         &self,
@@ -490,220 +602,311 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let row = &self.rows[index];
-        let entry = row
-            .entry
-            .and_then(|index| self.status.as_ref()?.entries.get(index));
-        let expanded = !self.collapsed.contains(&(row.kind, row.path.clone()));
         let section = row.path.as_os_str().is_empty();
         let selected = (self.selection_visible || focused) && self.selected == index;
-        let kind = row.kind;
-        let enabled = !self.git_busy() && !self.loading;
-        let section_entries = if section {
-            self.review_entries(kind)
-        } else {
-            Vec::new()
-        };
-        let stage_label = if kind == DiffKind::WorkingTree {
-            "Stage"
-        } else {
-            "Unstage"
-        };
-        div()
-            .h(px(if section { 32.0 } else { GIT_ROW_HEIGHT }))
-            .w_full()
+        let entry = row
+            .entry
+            .and_then(|entry| self.status.as_ref()?.entries.get(entry));
+        let content = div()
+            .id(("git-row", index))
+            .group("git-change-row")
+            .debug_selector(move || format!("git-row-{index}"))
+            .size_full()
             .min_w_0()
             .overflow_hidden()
-            .px(px(8.0))
+            .pl(px(
+                chrome::SMALL_GAP + row.depth.saturating_sub(1) as f32 * chrome::TREE_INDENT
+            ))
+            .pr(px(4.0))
+            .flex()
+            .items_center()
+            .gap(px(chrome::SMALL_GAP))
+            .rounded(px(ROW_RADIUS))
+            .border_1()
+            .border_color(if selected && focused {
+                theme::focus()
+            } else {
+                rgba(0)
+            })
+            .bg(if selected && focused {
+                theme::selection()
+            } else if selected {
+                theme::panel_hover()
+            } else {
+                rgba(0)
+            })
+            .when(!selected, |row| {
+                row.hover(|style| style.bg(theme::panel_hover()))
+            })
+            .cursor_pointer()
+            .on_click(cx.listener(move |view, _, window, cx| {
+                window.focus(&view.focus);
+                view.selection_visible = true;
+                view.open_change(index, cx);
+            }));
+        let content = if section {
+            self.section_content(content, index, cx)
+        } else if let Some(entry) = entry {
+            self.file_content(content, index, entry, selected, cx)
+        } else {
+            self.folder_content(content, index)
+        };
+        // Later sections get breathing room so each heading starts a new group.
+        let spaced = section && index > 0;
+        div()
+            .h(px(match (section, spaced) {
+                (true, true) => SECTION_ROW_HEIGHT + SECTION_GAP,
+                (true, false) => SECTION_ROW_HEIGHT,
+                _ => GIT_ROW_HEIGHT,
+            }))
+            .when(spaced, |row| row.pt(px(SECTION_GAP)))
+            .w_full()
+            .min_w_0()
+            .px(px(ROW_INSET))
             .relative()
-            // Guides sit under each ancestor's chevron: row inset, border,
-            // content inset, and half the 14px chevron slot.
+            // Guides run under each ancestor's chevron: row inset, border, content
+            // inset, and half the chevron slot, less half the line width.
             .children((1..row.depth).map(|depth| {
                 div()
                     .absolute()
-                    .left(px(19.5 + (depth - 1) as f32 * chrome::TREE_INDENT))
+                    .left(px(ROW_INSET
+                        + 1.0
+                        + chrome::SMALL_GAP
+                        + DISCLOSURE_WIDTH / 2.0
+                        - 0.5
+                        + (depth - 1) as f32 * chrome::TREE_INDENT))
                     .top_0()
                     .bottom_0()
                     .w(px(1.0))
                     .bg(theme::edge_soft())
             }))
+            .child(content)
+            .into_any_element()
+    }
+
+    /// Section heading in the History day-row style: label, count, rule, bulk actions.
+    /// The actions share the file rows' action columns.
+    fn section_content(
+        &self,
+        content: gpui::Stateful<gpui::Div>,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let row = &self.rows[index];
+        let kind = row.kind;
+        let working = kind == DiffKind::WorkingTree;
+        let expanded = !self.collapsed.contains(&(kind, PathBuf::new()));
+        let status = self.status.as_ref();
+        // Background refreshes do not dim the actions; their handlers ignore clicks
+        // until the refresh lands, so the always-visible headings stay still.
+        let available = !self.git_busy() && status.is_some_and(|status| !status.truncated);
+        let conflicted = status.is_some_and(|status| {
+            status
+                .entries
+                .iter()
+                .any(|entry| entry.conflicted && entry.unstaged())
+        });
+        content
+            .child(disclosure(expanded))
             .child(
                 div()
-                    .id(("git-row", index))
-                    .group("git-change-row")
-                    .debug_selector(move || format!("git-row-{index}"))
-                    .size_full()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .pl(px(
-                        4.0 + row.depth.saturating_sub(1) as f32 * chrome::TREE_INDENT
-                    ))
-                    .pr(px(6.0))
+                    .flex_shrink_0()
+                    .text_size(px(chrome::DETAIL_TEXT_SIZE))
+                    .line_height(px(chrome::DETAIL_LINE_HEIGHT))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::ash())
+                    .child(if working { "Changes" } else { "Staged" }),
+            )
+            .child(count_label(row.count))
+            .child(div().flex_1().min_w(px(8.0)).h(px(1.0)).bg(theme::edge()))
+            .child(
+                div()
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
-                    .gap(px(6.0))
-                    .rounded(px(4.0))
-                    .text_size(px(if section { 12.0 } else { 13.0 }))
-                    .font_weight(if section {
-                        FontWeight::MEDIUM
+                    .gap(px(ROW_ACTION_GAP))
+                    .child(if working {
+                        row_action(
+                            "git-discard-all",
+                            "icons/undo.svg",
+                            available && !conflicted,
+                        )
+                        .debug_selector(|| "git-discard-all".into())
+                        .tooltip(text_tooltip(if conflicted {
+                            "Resolve merge conflicts before discarding"
+                        } else {
+                            "Discard all changes"
+                        }))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |view, _, window, cx| {
+                            cx.stop_propagation();
+                            if view.status.as_ref().is_none_or(|status| status.truncated) {
+                                return;
+                            }
+                            let entries = view.review_entries(DiffKind::WorkingTree);
+                            view.request_discard(entries, window, cx);
+                        }))
+                        .into_any_element()
                     } else {
-                        FontWeight::NORMAL
+                        action_spacer().into_any_element()
                     })
-                    .text_color(if entry.is_none() && !section {
-                        theme::bone_dim()
-                    } else {
-                        theme::bone()
-                    })
-                    .border_1()
-                    .border_color(if selected && focused {
-                        theme::focus()
-                    } else {
-                        rgba(0)
-                    })
-                    .bg(if selected && focused {
-                        theme::selection()
-                    } else if selected {
-                        theme::panel_hover()
-                    } else {
-                        rgba(0)
-                    })
-                    .hover(|style| style.bg(theme::panel_hover()))
-                    .cursor_pointer()
-                    .tooltip(text_tooltip(row.path.to_string_lossy().into_owned()))
-                    .on_click(cx.listener(move |view, _, window, cx| {
-                        window.focus(&view.focus);
-                        view.selection_visible = true;
-                        view.open_change(index, cx);
-                    }))
+                    .child(
+                        row_action(("git-section-stage", index), stage_icon(kind), available)
+                            .tooltip(text_tooltip(if working {
+                                "Stage all changes"
+                            } else {
+                                "Unstage all changes"
+                            }))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                cx.stop_propagation();
+                                if view.status.as_ref().is_none_or(|status| status.truncated) {
+                                    return;
+                                }
+                                let entries = view.review_entries(kind);
+                                view.stage_entries(entries, working, window, cx);
+                            })),
+                    ),
+            )
+    }
+
+    /// Folder rows mirror the Files tree; a collapsed folder shows how many changes it hides.
+    fn folder_content(
+        &self,
+        content: gpui::Stateful<gpui::Div>,
+        index: usize,
+    ) -> gpui::Stateful<gpui::Div> {
+        let row = &self.rows[index];
+        let expanded = !self.collapsed.contains(&(row.kind, row.path.clone()));
+        content
+            .tooltip(text_tooltip(row.path.to_string_lossy().into_owned()))
+            .child(disclosure(expanded))
+            .child(project_icon(&row.path, true, expanded))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(theme::bone_dim())
+                    .child(row.label.clone()),
+            )
+            .when(!expanded, |item| item.child(count_label(row.count)))
+    }
+
+    /// File names take the Files panel's status colors. Line counts sit flush right;
+    /// on hover or selection the stage and discard actions take their place.
+    fn file_content(
+        &self,
+        content: gpui::Stateful<gpui::Div>,
+        index: usize,
+        entry: &GitEntry,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let row = &self.rows[index];
+        let kind = row.kind;
+        let working = kind == DiffKind::WorkingTree;
+        let marker = entry.marker(kind);
+        // Like the headings, row actions ignore background refreshes visually.
+        let enabled = !self.git_busy();
+        let mut tooltip = format!(
+            "{} · {}",
+            entry.relative_path.display(),
+            git_status_label(marker)
+        );
+        if let Some(original) = entry.original_path.as_ref().filter(|_| marker == "R") {
+            let original = original.strip_prefix(&self.root).unwrap_or(original);
+            tooltip.push_str(&format!(" from {}", original.display()));
+        }
+        let discard_entry = entry.clone();
+        let stage_entry = entry.clone();
+        content
+            .tooltip(text_tooltip(tooltip))
+            .child(div().w(px(DISCLOSURE_WIDTH)).flex_shrink_0())
+            .child(project_icon(&row.path, false, false))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .text_color(marker_color(marker))
+                    .when(marker == "D", |name| name.line_through())
+                    .child(filename(&row.path)),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex_shrink_0()
+                    .min_w(px(ROW_ACTIONS_WIDTH))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .child(
+                        line_counts(entry.stats(kind), entry.conflicted)
+                            .when(selected, |counts| counts.invisible())
+                            .group_hover("git-change-row", |style| style.invisible()),
+                    )
                     .child(
                         div()
-                            .w(px(14.0))
-                            .flex_shrink_0()
-                            .when(entry.is_none(), |item| {
-                                item.child(panel_icon(if expanded {
-                                    "icons/chevron-down.svg"
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .right_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(ROW_ACTION_GAP))
+                            .when(!selected, |actions| actions.invisible())
+                            .group_hover("git-change-row", |style| style.visible())
+                            .child(if working {
+                                row_action(
+                                    ("git-discard", index),
+                                    "icons/undo.svg",
+                                    enabled && !entry.conflicted,
+                                )
+                                .tooltip(text_tooltip(if entry.untracked {
+                                    "Discard new file · move to Recycle Bin"
                                 } else {
-                                    "icons/chevron-right.svg"
+                                    "Discard unstaged changes"
                                 }))
-                            }),
-                    )
-                    .when(!section, |item| {
-                        item.child(project_icon(&row.path, entry.is_none(), expanded))
-                    })
-                    .child(if section {
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(if kind == DiffKind::Staged {
-                                "Staged"
-                            } else {
-                                "Unstaged"
-                            })
-                            .into_any_element()
-                    } else {
-                        filename(&row.path).into_any_element()
-                    })
-                    .when(section, |item| {
-                        item.child(
-                            div()
-                                .flex_shrink_0()
-                                .font_family(theme::mono())
-                                .text_size(px(11.0))
-                                .text_color(theme::ash())
-                                .child(row.count.to_string()),
-                        )
-                    })
-                    .when(section, |item| {
-                        item.child(
-                            git_icon_button(
-                                ("git-section-stage", index),
-                                Some(stage_icon(kind)),
-                                enabled
-                                    && !section_entries.is_empty()
-                                    && self.status.as_ref().is_some_and(|s| !s.truncated),
-                            )
-                            .tooltip(text_tooltip(format!(
-                                "{stage_label} all files in this section"
-                            )))
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(
-                                move |view, _, window, cx| {
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |view, _, window, cx| {
                                     cx.stop_propagation();
-                                    if view.status.as_ref().is_none_or(|status| status.truncated) {
-                                        return;
-                                    }
-                                    view.stage_entries(
-                                        section_entries.clone(),
-                                        kind == DiffKind::WorkingTree,
-                                        window,
-                                        cx,
-                                    );
-                                },
-                            )),
-                        )
-                    })
-                    .when_some(entry.cloned(), |item, entry| {
-                        let undo_entry = entry.clone();
-                        item.child(line_stats(entry.stats(kind), entry.conflicted))
+                                    view.request_discard(vec![discard_entry.clone()], window, cx);
+                                }))
+                                .into_any_element()
+                            } else {
+                                action_spacer().into_any_element()
+                            })
                             .child(
-                                // Row actions stay out of the way until the row is
-                                // hovered or selected; keyboard selection reveals them.
-                                div()
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .items_center()
-                                    .when(!selected, |actions| actions.invisible())
-                                    .group_hover("git-change-row", |style| style.visible())
-                                    .child(if kind == DiffKind::WorkingTree {
-                                        git_icon_button(
-                                            ("git-discard", index),
-                                            Some("icons/undo.svg"),
-                                            enabled && !entry.conflicted,
-                                        )
-                                        .tooltip(text_tooltip(if entry.untracked {
-                                            "Discard new file · move to Recycle Bin"
-                                        } else {
-                                            "Discard unstaged changes"
-                                        }))
-                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                            cx.stop_propagation()
-                                        })
-                                        .on_click(cx.listener(move |view, _, window, cx| {
-                                            cx.stop_propagation();
-                                            view.request_discard(undo_entry.clone(), window, cx);
-                                        }))
-                                        .into_any_element()
+                                row_action(("git-stage", index), stage_icon(kind), enabled)
+                                    .tooltip(text_tooltip(if working {
+                                        "Stage"
                                     } else {
-                                        div().w(px(28.0)).flex_shrink_0().into_any_element()
+                                        "Unstage"
+                                    }))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
                                     })
-                                    .child(
-                                        git_icon_button(
-                                            ("git-stage", index),
-                                            Some(stage_icon(kind)),
-                                            enabled,
-                                        )
-                                        .tooltip(text_tooltip(format!(
-                                            "{stage_label} {}",
-                                            entry.relative_path.display()
-                                        )))
-                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                            cx.stop_propagation()
-                                        })
-                                        .on_click(
-                                            cx.listener(move |view, _, window, cx| {
-                                                cx.stop_propagation();
-                                                view.stage_entries(
-                                                    vec![entry.clone()],
-                                                    kind == DiffKind::WorkingTree,
-                                                    window,
-                                                    cx,
-                                                );
-                                            }),
-                                        ),
-                                    ),
-                            )
-                    }),
+                                    .on_click(cx.listener(move |view, _, window, cx| {
+                                        cx.stop_propagation();
+                                        view.stage_entries(
+                                            vec![stage_entry.clone()],
+                                            working,
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            ),
+                    ),
             )
-            .into_any_element()
+    }
+
+    /// Whether any folder in the change tree is open, so Collapse all has work to do.
+    fn has_expanded_folder(&self) -> bool {
+        self.rows.windows(2).any(|pair| {
+            pair[0].entry.is_none() && pair[0].depth > 0 && pair[1].depth > pair[0].depth
+        })
     }
 
     fn can_push(&self) -> bool {
@@ -804,10 +1007,12 @@ impl GitPanel {
         let enabled = !self.git_busy() && !self.loading;
         let branch = self.branch().unwrap_or("No repository").to_owned();
         let open = self.branch_picker;
+        // The trigger hugs the branch name so its chevron reads as part of it; a
+        // long name truncates before the header actions do.
         div()
             .relative()
-            .flex_1()
             .min_w_0()
+            .flex()
             .on_children_prepainted(cx.processor(|view, bounds: Vec<Bounds<Pixels>>, _, _| {
                 view.branch_bounds = bounds.first().copied();
             }))
@@ -815,13 +1020,12 @@ impl GitPanel {
                 div()
                     .id("choose-branch")
                     .h(px(28.0))
-                    .w_full()
                     .min_w_0()
                     .pl(px(6.0))
-                    .pr(px(8.0))
+                    .pr(px(6.0))
                     .flex()
                     .items_center()
-                    .gap(px(8.0))
+                    .gap(px(6.0))
                     .rounded(px(4.0))
                     .border_1()
                     .border_color(if open { theme::edge_hard() } else { rgba(0) })
@@ -852,7 +1056,6 @@ impl GitPanel {
                     .child(panel_icon("icons/branch.svg"))
                     .child(
                         div()
-                            .flex_1()
                             .min_w_0()
                             .truncate()
                             .font_family(theme::mono())
@@ -860,40 +1063,6 @@ impl GitPanel {
                             .text_size(px(12.0))
                             .line_height(px(20.0))
                             .child(branch),
-                    )
-                    .when_some(
-                        self.repository
-                            .as_ref()
-                            .and_then(|repo| repo.ahead)
-                            .filter(|ahead| *ahead > 0),
-                        |control, ahead| {
-                            control.child(
-                                div()
-                                    .flex_shrink_0()
-                                    .font_family(theme::mono())
-                                    .text_size(px(11.0))
-                                    .line_height(px(16.0))
-                                    .text_color(theme::success())
-                                    .child(format!("↑{ahead}")),
-                            )
-                        },
-                    )
-                    .when_some(
-                        self.repository
-                            .as_ref()
-                            .and_then(|repo| repo.behind)
-                            .filter(|behind| *behind > 0),
-                        |control, behind| {
-                            control.child(
-                                div()
-                                    .flex_shrink_0()
-                                    .font_family(theme::mono())
-                                    .text_size(px(11.0))
-                                    .line_height(px(16.0))
-                                    .text_color(theme::focus())
-                                    .child(format!("↓{behind}")),
-                            )
-                        },
                     )
                     .child(
                         svg()
@@ -920,6 +1089,52 @@ impl GitPanel {
                 )
             })
             .into_any_element()
+    }
+
+    /// Commits ahead of and behind the upstream, shown only when out of sync.
+    fn sync_status(&self) -> Option<gpui::AnyElement> {
+        let repository = self.repository.as_ref()?;
+        let upstream = repository.upstream.as_ref()?;
+        let ahead = repository.ahead.unwrap_or(0);
+        let behind = repository.behind.unwrap_or(0);
+        let tooltip = match (ahead, behind) {
+            (0, 0) => return None,
+            (ahead, 0) => format!(
+                "{ahead} commit{} to push to {}",
+                plural(ahead),
+                upstream.label
+            ),
+            (0, behind) => format!(
+                "{behind} commit{} to pull from {}",
+                plural(behind),
+                upstream.label
+            ),
+            (ahead, behind) => format!("{ahead} to push · {behind} to pull · {}", upstream.label),
+        };
+        Some(
+            div()
+                .id("git-sync")
+                .flex_shrink_0()
+                .px(px(4.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .font_family(theme::mono())
+                .text_size(px(chrome::DETAIL_TEXT_SIZE))
+                .line_height(px(chrome::DETAIL_LINE_HEIGHT))
+                .tooltip(text_tooltip(tooltip))
+                .when(ahead > 0, |sync| {
+                    sync.child(
+                        div()
+                            .text_color(theme::success())
+                            .child(format!("↑{ahead}")),
+                    )
+                })
+                .when(behind > 0, |sync| {
+                    sync.child(div().text_color(theme::focus()).child(format!("↓{behind}")))
+                })
+                .into_any_element(),
+        )
     }
 
     fn branch_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1131,7 +1346,39 @@ impl GitPanel {
             .flex()
             .flex_col()
             .when_some(self.pending_discard.as_ref(), |panel, plan| {
-                let path = plan.path.strip_prefix(&self.root).unwrap_or(&plan.path);
+                let (title, subject, detail, confirm) = match plan.files.as_slice() {
+                    [file] => (
+                        "Discard file changes?",
+                        file.path
+                            .strip_prefix(&self.root)
+                            .unwrap_or(&file.path)
+                            .to_string_lossy()
+                            .into_owned(),
+                        if file.untracked {
+                            "Move this new file to the Recycle Bin.".to_owned()
+                        } else {
+                            "Unstaged edits will be removed. Staged content is kept.".to_owned()
+                        },
+                        if file.untracked {
+                            "Move to Recycle Bin"
+                        } else {
+                            "Discard changes"
+                        },
+                    ),
+                    files => (
+                        "Discard all changes?",
+                        format!("{} files", files.len()),
+                        match plan.untracked_count() {
+                            0 => "Unstaged edits will be removed. Staged content is kept."
+                                .to_owned(),
+                            count => format!(
+                                "Unstaged edits will be removed and {count} new file{} moved to the Recycle Bin. Staged content is kept.",
+                                plural(count)
+                            ),
+                        },
+                        "Discard all",
+                    ),
+                };
                 panel.child(
                     div()
                         .p(px(12.0))
@@ -1145,22 +1392,21 @@ impl GitPanel {
                             div()
                                 .text_size(px(12.0))
                                 .font_weight(FontWeight::MEDIUM)
-                                .child("Discard file changes?"),
+                                .child(title),
                         )
                         .child(
                             div()
                                 .min_w_0()
                                 .truncate()
                                 .text_size(px(11.0))
-                                .child(path.to_string_lossy().into_owned()),
+                                .child(subject),
                         )
-                        .child(div().text_size(px(11.0)).text_color(theme::ash()).child(
-                            if plan.untracked {
-                                "Move this new file to the Recycle Bin."
-                            } else {
-                                "Unstaged edits will be removed. Staged content is kept."
-                            },
-                        ))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme::ash())
+                                .child(detail),
+                        )
                         .child(
                             div()
                                 .flex()
@@ -1177,11 +1423,7 @@ impl GitPanel {
                                 .child(
                                     git_control(
                                         "confirm-git-discard",
-                                        if plan.untracked {
-                                            "Move to Recycle Bin"
-                                        } else {
-                                            "Discard changes"
-                                        },
+                                        confirm,
                                         Some("icons/undo.svg"),
                                         true,
                                     )
@@ -1267,12 +1509,12 @@ impl GitPanel {
             .into_any_element()
     }
 
-    /// Commit card: a borderless message field over a footer that carries the
-    /// staged count and the commit and push actions, so they read as one unit.
+    /// Commit card: a borderless message field over a footer that carries what the
+    /// commit will include and the commit and push actions, so they read as one unit.
+    /// The footer's left slot also reports background operations, keeping the header still.
     fn composer(&self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let staged = self.status.as_ref().map_or(0, |status| {
-            status.entries.iter().filter(|entry| entry.staged()).count()
-        });
+        let staged = self.staged_count();
+        let changes = self.change_count().unwrap_or(0);
         let can_commit = self.can_commit(cx);
         let committing = self.operation == Some("Committing…");
         let pushing = self.operation == Some("Pushing…");
@@ -1281,9 +1523,16 @@ impl GitPanel {
         let show_pull = pulling || self.can_pull();
         let focused =
             gpui::Focusable::focus_handle(self.commit_input.read(cx), cx).is_focused(window);
-        let summary = match staged {
-            0 => "Nothing staged".to_owned(),
-            count => format!("{count} staged"),
+        // Commit, push, and pull name their own progress on their buttons.
+        let operation = self
+            .operation
+            .filter(|operation| !matches!(*operation, "Committing…" | "Pushing…" | "Pulling…"));
+        let summary = match (operation, staged, changes) {
+            (Some(operation), _, _) => operation.to_owned(),
+            (None, 0, 0) => "Nothing to commit".to_owned(),
+            (None, 0, 1) => "Commits 1 change".to_owned(),
+            (None, 0, changes) => format!("Commits all {changes} changes"),
+            (None, staged, _) => format!("{staged} staged"),
         };
         div()
             .p(px(12.0))
@@ -1441,10 +1690,10 @@ impl GitPanel {
             "icons/check.svg",
             can_commit,
         )
-        .tooltip(text_tooltip(if can_commit {
-            "Commit staged changes · Ctrl+Enter"
-        } else {
-            "Write a message and stage changes to commit. Resolve any conflicts first."
+        .tooltip(text_tooltip(match (can_commit, self.staged_count()) {
+            (true, 0) => "Stage all changes and commit · Ctrl+Enter",
+            (true, _) => "Commit staged changes · Ctrl+Enter",
+            (false, _) => "Write a message to commit. Resolve any conflicts first.",
         }))
         .when(can_commit, |button| {
             button.on_click(cx.listener(|view, _, window, cx| view.commit_staged(window, cx)))
@@ -1666,25 +1915,17 @@ impl GitPanel {
                                 true,
                             )
                             .tooltip(text_tooltip("Back to changes"))
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.toggle_history(window, cx)
-                            })),
+                            .on_click(
+                                cx.listener(|view, _, window, cx| view.toggle_history(window, cx)),
+                            ),
                         )
                     })
                     .child(self.branch_select(cx))
-                    .when_some(
-                        self.operation
-                            .or((self.loading && self.operation.is_none()).then_some("Refreshing…")),
-                        |header, status| {
-                            header.child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_size(px(chrome::DETAIL_TEXT_SIZE))
-                                    .text_color(theme::ash())
-                                    .child(status),
-                            )
-                        },
-                    )
+                    // History's Push and Pull buttons carry the counts there.
+                    .when(!self.history.visible, |header| {
+                        header.children(self.sync_status())
+                    })
+                    .child(div().flex_1())
                     .when(
                         self.history.visible
                             && (self.can_pull() || self.operation == Some("Pulling…")),
@@ -1693,17 +1934,20 @@ impl GitPanel {
                     .when(self.history.visible, |header| {
                         header.child(self.push_button(cx))
                     })
-                    .when(!self.history.visible && count > 0, |header| {
-                        header.child(
-                            git_icon_button(
-                                "collapse-git",
-                                Some("icons/collapse-all.svg"),
-                                true,
+                    .when(
+                        !self.history.visible && self.has_expanded_folder(),
+                        |header| {
+                            header.child(
+                                git_icon_button(
+                                    "collapse-git",
+                                    Some("icons/collapse-all.svg"),
+                                    true,
+                                )
+                                .tooltip(text_tooltip("Collapse all folders"))
+                                .on_click(cx.listener(|view, _, _, cx| view.collapse_all(cx))),
                             )
-                            .tooltip(text_tooltip("Collapse all folders"))
-                            .on_click(cx.listener(|view, _, _, cx| view.collapse_all(cx))),
-                        )
-                    })
+                        },
+                    )
                     .when(!self.history.visible, |header| {
                         header.child(
                             git_icon_button(
@@ -1712,9 +1956,9 @@ impl GitPanel {
                                 self.repository.is_some(),
                             )
                             .tooltip(text_tooltip("History"))
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.toggle_history(window, cx)
-                            })),
+                            .on_click(
+                                cx.listener(|view, _, window, cx| view.toggle_history(window, cx)),
+                            ),
                         )
                     })
                     .child(
@@ -1809,30 +2053,31 @@ impl GitPanel {
             .when_some(
                 self.error.clone().filter(|_| !self.not_repository),
                 |panel, error| {
-                panel.child(
-                    div()
-                        .p(px(12.0))
-                        .flex_shrink_0()
-                        .flex()
-                        .flex_col()
-                        .gap(px(6.0))
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .text_color(theme::error())
-                                .child(error),
-                        )
-                        .child(
-                            git_control(
-                                "retry-git-status",
-                                "Retry",
-                                Some("icons/refresh.svg"),
-                                !busy,
+                    panel.child(
+                        div()
+                            .p(px(12.0))
+                            .flex_shrink_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(theme::error())
+                                    .child(error),
                             )
-                            .on_click(cx.listener(|view, _, _, cx| view.refresh(cx))),
-                        ),
-                )
-            })
+                            .child(
+                                git_control(
+                                    "retry-git-status",
+                                    "Retry",
+                                    Some("icons/refresh.svg"),
+                                    !busy,
+                                )
+                                .on_click(cx.listener(|view, _, _, cx| view.refresh(cx))),
+                            ),
+                    )
+                },
+            )
             .child(self.operation_feedback(cx))
             .when(!self.history.visible && !self.not_repository, |panel| {
                 panel.child(self.composer(window, cx))
@@ -1843,41 +2088,4 @@ impl GitPanel {
 
 fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
-}
-
-fn line_stats(stats: Option<project_git::GitLineStats>, conflict: bool) -> gpui::AnyElement {
-    div()
-        .w(px(68.0))
-        .flex_shrink_0()
-        .min_w_0()
-        .overflow_hidden()
-        .flex()
-        .justify_end()
-        .gap(px(4.0))
-        .font_family(theme::mono())
-        .text_size(px(10.0))
-        .when_some(stats.filter(|_| !conflict), |row, stats| {
-            row.child(
-                div()
-                    .text_color(theme::success())
-                    .child(format!("+{}", stats.additions)),
-            )
-            .child(
-                div()
-                    .text_color(theme::error())
-                    .child(format!("−{}", stats.deletions)),
-            )
-        })
-        .when(conflict || stats.is_none(), |row| {
-            row.child(
-                div()
-                    .text_color(if conflict {
-                        theme::error()
-                    } else {
-                        theme::ash()
-                    })
-                    .child(if conflict { "Conflict" } else { "—" }),
-            )
-        })
-        .into_any_element()
 }
